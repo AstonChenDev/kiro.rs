@@ -871,6 +871,15 @@ impl WebSearchUsageSettlement {
         self.usage.sanitized()
     }
 
+    /// 构造最终响应的计费信息：费用取整条 agentic loop 中所有模型调用的
+    /// meteringEvent 累计值，单位沿用最近一次上游事件。
+    fn response_metering(&self, latest: Option<&MeteringEvent>) -> Option<MeteringEvent> {
+        latest.map(|metering| MeteringEvent {
+            usage: self.credits,
+            ..metering.clone()
+        })
+    }
+
     fn finish(
         &mut self,
         usage_status: &str,
@@ -1477,7 +1486,8 @@ async fn run_web_search_loop_inner(
                 round.resolved_token_usage(round_fallback_input_tokens, round_cache_usage);
             settlement.add(credential_id, round_usage, round.credits);
             settlement.note_source(usage_source);
-            // 跨 round 保留最近一次 meteringEvent，多 round 时取最后一次
+            // 跨 round 保留最近一次 meteringEvent 的单位字段；最终响应中的 usage
+            // 会替换为 settlement 累计的所有模型调用费用。
             // (clone 以避免与 empty_tool_result_disposition 后续对 round 的借用冲突)。
             if let Some(ref m) = round.last_metering {
                 latest_metering = Some(m.clone());
@@ -1627,6 +1637,7 @@ async fn run_web_search_loop_inner(
         );
 
         let final_usage = settlement.usage();
+        let final_metering = settlement.response_metering(latest_metering.as_ref());
         settlement.finish("success", "success", None, None);
 
         return if let Some(emitter) = emitter.as_deref_mut() {
@@ -1636,7 +1647,7 @@ async fn run_web_search_loop_inner(
                     &stop_reason,
                     final_usage,
                     &all_thinking,
-                    latest_metering.as_ref(),
+                    final_metering.as_ref(),
                 )
                 .await;
             StatusCode::OK.into_response()
@@ -1647,7 +1658,7 @@ async fn run_web_search_loop_inner(
                 &stop_reason,
                 final_usage,
                 &all_thinking,
-                latest_metering.as_ref(),
+                final_metering.as_ref(),
             )
         };
     }
@@ -3406,6 +3417,60 @@ mod tests {
             cache_read_input_tokens: 0,
             cache_write_input_tokens: 0,
         }
+    }
+
+    #[test]
+    fn final_responses_sum_credit_usage_across_model_rounds() {
+        let hook = UsageRecordHook {
+            recorder: None,
+            aggregator: None,
+            client_keys: None,
+            key_id: 0,
+            model: "gpt-5.6-sol".to_string(),
+            started_at: std::time::Instant::now(),
+        };
+        let mut settlement = WebSearchUsageSettlement::without_trace(hook);
+        settlement.add(1, token_usage(10, 2), 0.25);
+        settlement.add(1, token_usage(20, 3), 0.50);
+        let latest = metering_event(0.50);
+        let metering = settlement
+            .response_metering(Some(&latest))
+            .expect("two metered rounds must produce response metering");
+
+        assert_eq!(metering.usage, 0.75);
+        assert_eq!(metering.unit, latest.unit);
+        assert_eq!(metering.unit_plural, latest.unit_plural);
+
+        let content = vec![json!({"type": "text", "text": "ok"})];
+        let response = render_json(
+            "gpt-5.6-sol",
+            content.clone(),
+            "end_turn",
+            settlement.usage(),
+            "",
+            Some(&metering),
+        );
+        let bytes = futures::executor::block_on(async {
+            axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+        });
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["usage"]["credit_usage"], json!(0.75));
+
+        let events = build_sse_events(
+            "gpt-5.6-sol",
+            content,
+            "end_turn",
+            settlement.usage(),
+            Some(&metering),
+        );
+        let delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("streaming response must contain message_delta");
+        assert_eq!(delta.data["usage"]["credit_usage"], json!(0.75));
+        settlement.settled = true;
     }
 
     #[test]
