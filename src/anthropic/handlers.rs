@@ -902,6 +902,8 @@ pub async fn post_messages(
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
+            state.cache_meter.clone(),
+            key_ctx.key_id,
         )
         .await;
     }
@@ -2070,6 +2072,8 @@ pub async fn post_messages_cc(
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
+            state.cache_meter.clone(),
+            key_ctx.key_id,
         )
         .await;
     }
