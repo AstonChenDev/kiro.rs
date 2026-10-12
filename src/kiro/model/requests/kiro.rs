@@ -57,6 +57,9 @@ pub struct KiroRequest {
 /// so this struct **must not** inherit `rename_all = "camelCase"`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AdditionalModelRequestFields {
+    /// Output budget, only sent to models whose upstream schema supports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<i32>,
     /// Claude reasoning effort (`output_config.effort`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<KiroOutputConfig>,
@@ -117,12 +120,15 @@ mod tests {
         // (`additionalModelRequestFields`) while the inner key stays snake_case
         // (`output_config`), matching real Kiro CLI traffic.
         let fields = AdditionalModelRequestFields {
+            max_tokens: Some(64000),
             output_config: Some(KiroOutputConfig {
                 effort: "max".to_string(),
             }),
             reasoning: None,
         };
         let v = serde_json::to_value(&fields).unwrap();
+        assert_eq!(v["max_tokens"], 64000);
+        assert!(v.get("maxTokens").is_none());
         assert_eq!(v["output_config"]["effort"], "max");
         assert!(v.get("reasoning").is_none());
         assert!(
@@ -134,6 +140,7 @@ mod tests {
     #[test]
     fn test_gpt_reasoning_effort_wire_format() {
         let fields = AdditionalModelRequestFields {
+            max_tokens: None,
             output_config: None,
             reasoning: Some(KiroReasoningConfig {
                 effort: "xhigh".to_string(),

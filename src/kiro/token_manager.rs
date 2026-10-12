@@ -3,6 +3,13 @@
 //! 负责 Token 过期检测和刷新，支持 Social 和 IdC 认证方式
 //! 支持多凭据 (MultiTokenManager) 管理
 
+use crate::kiro::error::UpstreamCredentialError;
+use crate::kiro::model::credentials::InvalidCredentialConfig;
+#[derive(Debug, thiserror::Error)]
+#[error("流量策略保存失败: {0}")]
+pub(crate) struct TrafficStorageError(pub anyhow::Error);
+
+use super::traffic::{CredentialTraffic, EffectiveLimits, TrafficPolicies, TrafficStatus, TrafficPermit};
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
@@ -75,24 +82,24 @@ pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::R
     let refresh_token = credentials
         .refresh_token
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("缺少 refreshToken"))?;
+        .ok_or_else(|| InvalidCredentialConfig("缺少 refreshToken".into()))?;
 
     validate_refresh_token_str(refresh_token)
 }
 
 /// 验证 refreshToken 字符串本身（调用方已确认 Token 存在）
 pub(crate) fn validate_refresh_token_str(refresh_token: &str) -> anyhow::Result<()> {
-    if refresh_token.is_empty() {
-        bail!("refreshToken 为空");
+    if refresh_token.trim().is_empty() {
+        return Err(InvalidCredentialConfig("refreshToken 为空".into()).into());
     }
 
     if refresh_token.len() < 100 || refresh_token.ends_with("...") || refresh_token.contains("...")
     {
-        bail!(
+        return Err(InvalidCredentialConfig(format!(
             "refreshToken 已被截断（长度: {} 字符）。\n\
              这通常是 Kiro IDE 为了防止凭证被第三方工具使用而故意截断的。",
             refresh_token.len()
-        );
+        )).into());
     }
 
     Ok(())
@@ -222,6 +229,7 @@ async fn refresh_social_token(
             500..=599 => "服务器错误，AWS OAuth 服务暂时不可用",
             _ => "Token 刷新失败",
         };
+        if let Some(error) = UpstreamCredentialError::from_response(status.as_u16(), &body_text) { return Err(error.into()); }
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
@@ -325,6 +333,7 @@ async fn refresh_idc_token(
             500..=599 => "服务器错误，AWS OIDC 服务暂时不可用",
             _ => "IdC Token 刷新失败",
         };
+        if let Some(error) = UpstreamCredentialError::from_response(status.as_u16(), &body_text) { return Err(error.into()); }
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
@@ -428,6 +437,7 @@ async fn refresh_external_idp_token(
             500..=599 => "服务器错误，IdP token 端点暂时不可用",
             _ => "External IdP Token 刷新失败",
         };
+        if let Some(error) = UpstreamCredentialError::from_response(status.as_u16(), &body_text) { return Err(error.into()); }
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
@@ -641,6 +651,7 @@ pub(crate) async fn get_usage_limits(
             500..=599 => "服务器错误，AWS 服务暂时不可用",
             _ => "获取使用额度失败",
         };
+        if let Some(error) = UpstreamCredentialError::from_response(status.as_u16(), &body_text) { return Err(error.into()); }
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
@@ -744,6 +755,7 @@ pub(crate) async fn get_available_models(
             500..=599 => "服务器错误，AWS 服务暂时不可用",
             _ => "获取可用模型失败",
         };
+        if let Some(error) = UpstreamCredentialError::from_response(status.as_u16(), &body_text) { return Err(error.into()); }
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
@@ -937,6 +949,7 @@ pub(crate) async fn set_user_preference(
             500..=599 => "服务器错误，AWS 服务暂时不可用",
             _ => "设置用户偏好失败",
         };
+        if let Some(error) = UpstreamCredentialError::from_response(status.as_u16(), &body_text) { return Err(error.into()); }
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
@@ -978,8 +991,13 @@ struct CredentialEntry {
     throttled_until: Option<Instant>,
     /// RPM 主动限流的滑动窗口：最近 60 秒内被选中发起请求的时间戳队列。
     /// 队列长度达到 `account_rpm_limit` 时该凭据本窗口内被排除出候选。
-    /// 不持久化，进程重启后清空；限流关闭时始终为空。
+    /// 不持久化，进程重启后清空；不限流时仍统计实时 RPM。
     rpm_window: VecDeque<Instant>,
+    active_requests: Arc<AtomicU32>,
+    // Runtime-only quota identity. Normal OAuth rotation keeps this generation;
+    // replacing authentication or recreating the entry invalidates old results.
+    balance_generation: String,
+    balance_auth_fingerprint: String,
     /// 当前凭据连续执行自愈的轮数。同一凭据成功后清零。
     self_heal_consecutive_rounds: u32,
     /// 当前凭据累计被自愈恢复的次数。
@@ -991,6 +1009,31 @@ struct CredentialEntry {
 }
 
 impl CredentialEntry {
+    /// Token refresh operates on a pre-network snapshot. Keep policy edits and
+    /// subscription discovery that completed while that refresh was in flight.
+    fn replace_refreshed_credentials(&mut self, source: &KiroCredentials, mut credentials: KiroCredentials) {
+        self.traffic_balance_identity();
+        if MultiTokenManager::traffic_auth_fingerprint(source) != self.balance_auth_fingerprint {
+            // A stale refresh must not reconnect a quota result to a replaced account.
+            self.balance_generation = uuid::Uuid::new_v4().to_string();
+        }
+        credentials.traffic = self.credentials.traffic.clone();
+        if self.credentials.subscription_title.is_some() {
+            credentials.subscription_title = self.credentials.subscription_title.clone();
+        }
+        self.balance_auth_fingerprint = MultiTokenManager::traffic_auth_fingerprint(&credentials);
+        self.credentials = credentials;
+    }
+
+    fn traffic_balance_identity(&mut self) -> String {
+        let fingerprint = MultiTokenManager::traffic_auth_fingerprint(&self.credentials);
+        if fingerprint != self.balance_auth_fingerprint {
+            self.balance_generation = uuid::Uuid::new_v4().to_string();
+            self.balance_auth_fingerprint = fingerprint;
+        }
+        self.balance_generation.clone()
+    }
+
     /// 清空失败计数与禁用/冷却状态，让凭据重新参与调度
     fn reset_health(&mut self) {
         self.failure_count = 0;
@@ -999,7 +1042,6 @@ impl CredentialEntry {
         self.disabled = false;
         self.disabled_reason = None;
         self.throttled_until = None;
-        self.rpm_window.clear();
         self.clear_self_heal_streak();
     }
 }
@@ -1244,6 +1286,7 @@ pub struct MultiTokenManager {
     account_rpm_limit_enabled: AtomicBool,
     /// 单账号每分钟请求次数上限（运行时可修改）
     account_rpm_limit: AtomicU32,
+    traffic_policies: Mutex<TrafficPolicies>,
     /// 是否识别 403 封禁文案并立即禁用（运行时可修改）
     suspended_detection_enabled: AtomicBool,
     /// 全账号自愈总开关（运行时可修改）
@@ -1417,6 +1460,8 @@ impl MultiTokenManager {
                     .map(|value| value.with_timezone(&Utc));
                 CredentialEntry {
                     id,
+                    balance_generation: uuid::Uuid::new_v4().to_string(),
+                    balance_auth_fingerprint: Self::traffic_auth_fingerprint(&cred),
                     credentials: cred.clone(),
                     failure_count: 0,
                     total_failure_count: 0,
@@ -1427,6 +1472,7 @@ impl MultiTokenManager {
                     last_used_at: None,
                     throttled_until: None,
                     rpm_window: VecDeque::new(),
+                    active_requests: Arc::new(AtomicU32::new(0)),
                     self_heal_consecutive_rounds: cred.self_heal_consecutive_rounds,
                     self_heal_total_count: cred.self_heal_total_count,
                     last_self_heal_at,
@@ -1490,7 +1536,11 @@ impl MultiTokenManager {
         let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
         let self_heal_max_consecutive_rounds = config.self_heal_max_consecutive_rounds;
         let quota_reset_recovery_enabled = config.quota_reset_recovery_enabled;
+        config.traffic_policies.validate()?;
+        for entry in &entries { entry.credentials.traffic.validate()?; }
+        let traffic_policies = Mutex::new(config.traffic_policies.clone());
         let manager = Self {
+            traffic_policies,
             config,
             proxy: Mutex::new(proxy),
             entries: Mutex::new(entries),
@@ -1898,32 +1948,32 @@ impl MultiTokenManager {
                 .map(|until| until > now)
                 .unwrap_or(false)
             && !self.rpm_exceeded(entry, now)
+            && !self.concurrency_exceeded(entry)
             && credential_matches_request(&entry.credentials, model, group)
             && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
     }
 
-    /// 判断凭据在当前 60 秒滑动窗口内是否已达到 RPM 上限。
-    ///
-    /// 限流未开启时恒为 `false`（不参与调度判断）。只读判断，不修改窗口；
-    /// 过期时间戳的实际清理发生在 [`Self::record_request`]。
-    fn rpm_exceeded(&self, entry: &CredentialEntry, now: Instant) -> bool {
-        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
-            return false;
-        }
-        let limit = self.account_rpm_limit.load(Ordering::Relaxed);
-        if limit == 0 {
-            return false;
-        }
-        let window = StdDuration::from_secs(RPM_WINDOW_SECS);
-        let fresh = entry
-            .rpm_window
-            .iter()
-            .filter(|&&ts| now.duration_since(ts) < window)
-            .count();
-        fresh as u32 >= limit
+    /// 分别解析并发与 RPM 的账号覆盖、类型策略及全局默认值。
+    fn effective_limits(&self, entry: &CredentialEntry) -> EffectiveLimits {
+        let default_rpm = if self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
+            self.account_rpm_limit.load(Ordering::Relaxed)
+        } else { 0 };
+        self.traffic_policies.lock().resolve(&entry.credentials.traffic,
+            entry.credentials.subscription_title.as_deref(), default_rpm)
     }
 
-    /// 当所有其它条件均满足的候选都耗尽 RPM 额度时，返回最早可重试秒数。
+    fn concurrency_exceeded(&self, entry: &CredentialEntry) -> bool {
+        let limit = self.effective_limits(entry).concurrency;
+        limit > 0 && entry.active_requests.load(Ordering::Acquire) >= limit
+    }
+
+    fn rpm_exceeded(&self, entry: &CredentialEntry, now: Instant) -> bool {
+        let limit = self.effective_limits(entry).rpm;
+        limit > 0 && entry.rpm_window.iter()
+            .filter(|&&ts| now.duration_since(ts).as_secs() < RPM_WINDOW_SECS).count() >= limit as usize
+    }
+
+    /// 候选均受流量限制时返回重试提示；并发释放时间未知，使用 1 秒提示。
     fn rpm_retry_after_secs(
         &self,
         entries: &[CredentialEntry],
@@ -1931,14 +1981,6 @@ impl MultiTokenManager {
         group: Option<&str>,
         now: Instant,
     ) -> Option<u64> {
-        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
-            return None;
-        }
-        let limit = self.account_rpm_limit.load(Ordering::Relaxed) as usize;
-        if limit == 0 {
-            return None;
-        }
-
         let window = StdDuration::from_secs(RPM_WINDOW_SECS);
         let mut earliest_retry_after = None;
 
@@ -1951,6 +1993,13 @@ impl MultiTokenManager {
                 && credential_matches_request(&entry.credentials, model, group)
                 && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
         }) {
+            if self.concurrency_exceeded(entry) {
+                // Concurrency has no exact release time; a one-second retry is a hint.
+                earliest_retry_after = Some(1);
+                continue;
+            }
+            let limit = self.effective_limits(entry).rpm as usize;
+            if limit == 0 { return None; }
             let fresh_count = entry
                 .rpm_window
                 .iter()
@@ -1991,36 +2040,149 @@ impl MultiTokenManager {
     /// 在同一把 `entries` 锁内完成过期清理、上限检查和记账，避免多个并发请求
     /// 在选择阶段同时通过检查后全部写入窗口。返回 `false` 表示额度已被其它请求
     /// 抢先占用，调用方应重新选择凭据。
-    fn record_request(&self, id: u64) -> bool {
+    #[cfg(test)]
+    fn record_request(&self, id: u64) -> bool { self.try_acquire_permit(id).is_some() }
+
+    /// Final atomic admission immediately before sending an upstream business request.
+    pub fn try_acquire_permit(&self, id: u64) -> Option<TrafficPermit> {
         let now = Instant::now();
-        let window = StdDuration::from_secs(RPM_WINDOW_SECS);
         let mut entries = self.entries.lock();
-        let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
-            return false;
-        };
-        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
-            if !entry.rpm_window.is_empty() {
-                entry.rpm_window.clear();
-            }
-            return true;
-        }
-        let limit = self.account_rpm_limit.load(Ordering::Relaxed);
-        if limit == 0 {
-            entry.rpm_window.clear();
-            return true;
-        }
-        while let Some(&front) = entry.rpm_window.front() {
-            if now.duration_since(front) >= window {
-                entry.rpm_window.pop_front();
-            } else {
-                break;
-            }
-        }
-        if entry.rpm_window.len() >= limit as usize {
-            return false;
+        let entry = entries.iter_mut().find(|e| e.id == id)?;
+        if entry.disabled || entry.throttled_until.is_some_and(|t| t > now)
+            || self.concurrency_exceeded(entry) || self.rpm_exceeded(entry, now) { return None; }
+        while entry.rpm_window.front().is_some_and(|t| now.duration_since(*t).as_secs() >= RPM_WINDOW_SECS) {
+            entry.rpm_window.pop_front();
         }
         entry.rpm_window.push_back(now);
-        true
+        entry.active_requests.fetch_add(1, Ordering::AcqRel);
+        Some(TrafficPermit(entry.active_requests.clone()))
+    }
+
+    fn update_traffic_config_file(&self, updater: impl FnOnce(&mut Config)) -> anyhow::Result<()> {
+        let Some(path) = self.config.config_path() else { return Ok(()); };
+        let _guard = self.config_write_lock.lock();
+        let mut fresh = Config::load_traffic_config(path).map_err(TrafficStorageError)?;
+        updater(&mut fresh);
+        fresh.save_traffic_config().map_err(TrafficStorageError)?;
+        Ok(())
+    }
+
+    // Caller holds persist_lock and entries. Only custom traffic/automatic-quota
+    // changes use this commit path; original management operations are unchanged.
+    fn save_traffic_credentials(&self, credentials: &[KiroCredentials]) -> anyhow::Result<()> {
+        use std::io::Write;
+        let Some(path) = self.credentials_path.as_ref() else { return Ok(()); };
+        let path = if path.is_symlink() { std::fs::canonicalize(path)? } else { path.clone() };
+        let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        let bytes = serde_json::to_vec_pretty(credentials)?;
+        let result = (|| -> anyhow::Result<()> {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+            let mut file = options.open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temporary, &path)?;
+            Ok(())
+        })();
+        if result.is_err() { let _ = std::fs::remove_file(&temporary); }
+        result.map_err(|e| TrafficStorageError(e).into())
+    }
+
+    fn traffic_auth_fingerprint(credentials: &KiroCredentials) -> String {
+        use sha2::{Digest, Sha256};
+        let data = serde_json::to_vec(&(&credentials.auth_method, &credentials.refresh_token,
+            &credentials.kiro_api_key, &credentials.client_id, &credentials.client_secret,
+            &credentials.region, &credentials.auth_region)).expect("credential strings serialize");
+        format!("{:x}", Sha256::digest(data))
+    }
+
+    pub(crate) fn balance_identity(&self, id: u64) -> anyhow::Result<String> {
+        self.entries.lock().iter_mut().find(|e| e.id == id)
+            .map(CredentialEntry::traffic_balance_identity)
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {id}"))
+    }
+
+    pub(crate) fn apply_traffic_quota(&self, id: u64, identity: &str, disable: bool) -> anyhow::Result<()> {
+        let _guard = self.persist_lock.lock();
+        let mut entries = self.entries.lock();
+        let index = entries.iter().position(|e| e.id == id)
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {id}"))?;
+        anyhow::ensure!(entries[index].traffic_balance_identity() == identity,
+            "账号认证信息已变化，请重新刷新额度");
+        if !disable || entries[index].disabled { return Ok(()); }
+        let mut snapshot: Vec<_> = entries.iter().map(CredentialEntry::credentials_snapshot).collect();
+        snapshot[index].disabled = true;
+        snapshot[index].disabled_reason = Some("QuotaExceeded".into());
+        snapshot[index].self_heal_consecutive_rounds = 0;
+        self.save_traffic_credentials(&snapshot)?;
+        let entry = &mut entries[index];
+        entry.disabled = true;
+        entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+        entry.clear_self_heal_streak();
+        Ok(())
+    }
+
+    pub fn traffic_policies(&self) -> TrafficPolicies { self.traffic_policies.lock().clone() }
+
+    pub fn set_traffic_policies(&self, policies: TrafficPolicies) -> anyhow::Result<()> {
+        policies.validate()?;
+        let _guard = self.runtime_config_update_lock.lock();
+        self.update_traffic_config_file(|cfg| cfg.traffic_policies = policies.clone())?;
+        *self.traffic_policies.lock() = policies;
+        Ok(())
+    }
+
+    /// Merge only explicitly edited types so unrelated concurrent edits are preserved.
+    pub fn patch_traffic_policies(&self, patch: super::traffic::TrafficPolicyPatch) -> anyhow::Result<TrafficPolicies> {
+        let _guard = self.runtime_config_update_lock.lock();
+        let mut policies = self.traffic_policies();
+        policies.tiers.extend(patch.tiers);
+        if let Some(value) = patch.default_concurrency { policies.default_concurrency = value; }
+        if let Some(value) = patch.auto_disable_quota { policies.auto_disable_quota = value; }
+        if let Some(value) = patch.disable_at_base_quota { policies.disable_at_base_quota = value; }
+        policies.validate()?;
+        self.update_traffic_config_file(|cfg| cfg.traffic_policies = policies.clone())?;
+        *self.traffic_policies.lock() = policies.clone();
+        Ok(policies)
+    }
+
+    pub fn set_credential_traffic(&self, id: u64, settings: CredentialTraffic) -> anyhow::Result<()> {
+        settings.validate()?;
+        self.update_credential_traffic(id, |current| *current = settings)
+    }
+
+    /// Clear only the account limits, preserving the tier at the time of this write.
+    pub fn restore_credential_traffic_limits(&self, id: u64) -> anyhow::Result<()> {
+        self.update_credential_traffic(id, |current| {
+            current.concurrency = None;
+            current.rpm = None;
+        })
+    }
+
+    fn update_credential_traffic(&self, id: u64, update: impl FnOnce(&mut CredentialTraffic)) -> anyhow::Result<()> {
+        let _guard = self.persist_lock.lock();
+        let mut entries = self.entries.lock();
+        let index = entries.iter().position(|e| e.id == id)
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {id}"))?;
+        let mut snapshot: Vec<_> = entries.iter().map(CredentialEntry::credentials_snapshot).collect();
+        update(&mut snapshot[index].traffic);
+        self.save_traffic_credentials(&snapshot)?;
+        entries[index].credentials.traffic = snapshot[index].traffic.clone();
+        Ok(())
+    }
+
+    pub fn traffic_status(&self) -> Vec<TrafficStatus> {
+        let now = Instant::now();
+        self.entries.lock().iter().map(|entry| {
+            let effective = self.effective_limits(entry);
+            let concurrency = entry.active_requests.load(Ordering::Acquire);
+            let rpm = entry.rpm_window.iter().filter(|&&ts| now.duration_since(ts).as_secs() < RPM_WINDOW_SECS).count();
+            let limited = (effective.concurrency > 0 && concurrency >= effective.concurrency)
+                || (effective.rpm > 0 && rpm >= effective.rpm as usize);
+            TrafficStatus { id: entry.id, settings: entry.credentials.traffic.clone(), effective, concurrency, rpm, limited }
+        }).collect()
     }
 
     fn has_available_for_request(
@@ -2215,6 +2377,12 @@ impl MultiTokenManager {
                 let (sticky_pick, route) = self.sticky_candidate(session, model, group);
                 let mut best = sticky_pick.or_else(|| self.select_next_credential(model, group));
 
+                if best.is_none() {
+                    let entries = self.entries.lock();
+                    if let Some(retry_after) = self.rpm_retry_after_secs(&entries, model, group, Instant::now()) {
+                        return Err(UpstreamRateLimitError::new(Some(retry_after.to_string())).into());
+                    }
+                }
                 // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
                 // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
                 if best.is_none() && self.try_self_heal(model, group) {
@@ -2251,11 +2419,6 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
-                    // 仅真实业务请求计入 RPM 窗口；Admin 只读模型发现不消耗额度。
-                    if update_current && !self.record_request(id) {
-                        // Token 获取期间额度可能被其它并发请求抢先占用；重新选号。
-                        continue;
-                    }
                     return Ok((ctx, is_balanced, route));
                 }
                 Err(e) => {
@@ -2342,7 +2505,7 @@ impl MultiTokenManager {
             let token = credentials
                 .kiro_api_key
                 .clone()
-                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
+                .ok_or_else(|| InvalidCredentialConfig("API Key 凭据缺少 kiroApiKey".into()))?;
             return Ok(CallContext {
                 id,
                 credentials: credentials.clone(),
@@ -2382,7 +2545,7 @@ impl MultiTokenManager {
                 {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
+                        entry.replace_refreshed_credentials(&current_creds, new_creds.clone());
                     }
                 }
 
@@ -3011,6 +3174,13 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> bool {
+        if !self.traffic_policies.lock().auto_disable_quota {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.throttled_until = Some(Instant::now() + StdDuration::from_secs(30));
+            }
+            return self.has_available_for_request(&entries, model, group);
+        }
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -3419,6 +3589,7 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if entry.disabled { return Ok(()); }
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
             entry.clear_self_heal_streak();
@@ -3624,7 +3795,7 @@ impl MultiTokenManager {
             credentials
                 .kiro_api_key
                 .clone()
-                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
+                .ok_or_else(|| InvalidCredentialConfig("API Key 凭据缺少 kiroApiKey".into()))?
         } else {
             // 检查是否需要刷新 token
             let needs_refresh =
@@ -3650,7 +3821,7 @@ impl MultiTokenManager {
                     {
                         let mut entries = self.entries.lock();
                         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
+                            entry.replace_refreshed_credentials(&current_creds, new_creds.clone());
                         }
                     }
                     // 持久化失败只记录警告，不影响本次请求
@@ -3779,7 +3950,7 @@ impl MultiTokenManager {
             credentials
                 .kiro_api_key
                 .clone()
-                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
+                .ok_or_else(|| InvalidCredentialConfig("API Key 凭据缺少 kiroApiKey".into()))?
         } else if is_token_expired(&credentials) || is_token_expiring_soon(&credentials) {
             let _guard = self.refresh_lock.lock().await;
             let current_creds = {
@@ -3799,7 +3970,7 @@ impl MultiTokenManager {
                 {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
+                        entry.replace_refreshed_credentials(&current_creds, new_creds.clone());
                     }
                 }
                 // 持久化失败只记录警告，不影响本次请求
@@ -3886,7 +4057,7 @@ impl MultiTokenManager {
             credentials
                 .kiro_api_key
                 .clone()
-                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
+                .ok_or_else(|| InvalidCredentialConfig("API Key 凭据缺少 kiroApiKey".into()))?
         } else {
             // 复用与 get_usage_limits_for 完全相同的过期检查与刷新逻辑
             let needs_refresh =
@@ -3912,7 +4083,7 @@ impl MultiTokenManager {
                     {
                         let mut entries = self.entries.lock();
                         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
+                            entry.replace_refreshed_credentials(&current_creds, new_creds.clone());
                         }
                     }
                     if let Err(e) = self.persist_credentials() {
@@ -3980,13 +4151,14 @@ impl MultiTokenManager {
     /// - `Err(_)` - 验证失败或添加失败
     pub async fn add_credential(self: &Arc<Self>, new_cred: KiroCredentials) -> anyhow::Result<u64> {
         // 1. 基本验证
+        new_cred.traffic.validate()?;
         if new_cred.is_api_key_credential() {
             let api_key = new_cred
                 .kiro_api_key
                 .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
+                .ok_or_else(|| InvalidCredentialConfig("API Key 凭据缺少 kiroApiKey".into()))?;
             if api_key.is_empty() {
-                anyhow::bail!("kiroApiKey 为空");
+                return Err(InvalidCredentialConfig("kiroApiKey 为空".into()).into());
             }
         } else {
             validate_refresh_token(&new_cred)?;
@@ -3997,7 +4169,7 @@ impl MultiTokenManager {
             let new_api_key = new_cred
                 .kiro_api_key
                 .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("缺少 kiroApiKey"))?;
+                .ok_or_else(|| InvalidCredentialConfig("缺少 kiroApiKey".into()))?;
             let new_api_key_hash = sha256_hex(new_api_key);
             let duplicate_exists = {
                 let entries = self.entries.lock();
@@ -4018,7 +4190,7 @@ impl MultiTokenManager {
             let new_refresh_token = new_cred
                 .refresh_token
                 .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("缺少 refreshToken"))?;
+                .ok_or_else(|| InvalidCredentialConfig("缺少 refreshToken".into()))?;
             let new_refresh_token_hash = sha256_hex(new_refresh_token);
             let duplicate_exists = {
                 let entries = self.entries.lock();
@@ -4125,6 +4297,8 @@ impl MultiTokenManager {
             }
             entries.push(CredentialEntry {
                 id: new_id,
+                balance_generation: uuid::Uuid::new_v4().to_string(),
+                balance_auth_fingerprint: Self::traffic_auth_fingerprint(&validated_cred),
                 credentials: validated_cred,
                 failure_count: 0,
                 total_failure_count: 0,
@@ -4135,6 +4309,7 @@ impl MultiTokenManager {
                 last_used_at: None,
                 throttled_until: None,
                 rpm_window: VecDeque::new(),
+                    active_requests: Arc::new(AtomicU32::new(0)),
                 self_heal_consecutive_rounds: 0,
                 self_heal_total_count: 0,
                 last_self_heal_at: None,
@@ -4507,7 +4682,7 @@ impl MultiTokenManager {
             // 更新 entries 中对应凭据
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                entry.credentials = new_creds;
+                entry.replace_refreshed_credentials(&credentials, new_creds);
                 entry.refresh_failure_count = 0;
             }
         }
@@ -4710,8 +4885,8 @@ impl MultiTokenManager {
 
     /// 设置单账号 RPM 限流配置（Admin API）。
     ///
-    /// 任一参数传 `None` 表示不修改该字段。关闭限流时会清空所有凭据的窗口计数，
-    /// 避免下次开启时残留旧时间戳造成误判。
+    /// 任一参数传 `None` 表示不修改该字段。修改全局默认不清空实时计数，
+    /// 类型策略与单账号覆盖仍按各自设置生效。
     pub fn set_account_rpm_limit_config(
         &self,
         enabled: Option<bool>,
@@ -4747,11 +4922,7 @@ impl MultiTokenManager {
         }
 
         // 关闭限流时清空窗口，避免重新开启后残留旧计数误判。
-        if !new_enabled {
-            for entry in self.entries.lock().iter_mut() {
-                entry.rpm_window.clear();
-            }
-        }
+
 
         tracing::info!(
             "单账号 RPM 限流配置已更新: enabled={}, limit={}",
@@ -4901,6 +5072,209 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[test]
+    fn traffic_restore_limits_preserves_latest_tier_counters_and_saved_fields() {
+        use crate::kiro::traffic::{AccountTier, Limits};
+        let (dir, path) = issue51_credentials_path("traffic_restore_limits");
+        let mut config = Config::default();
+        config.traffic_policies.tiers.insert(AccountTier::Student, Limits { concurrency: Some(20), rpm: Some(10) });
+        let original = KiroCredentials {
+            id: Some(1), email: Some("restore-test@example.invalid".into()),
+            traffic: CredentialTraffic { tier: Some(AccountTier::Power), concurrency: Some(150), rpm: Some(100) },
+            ..Default::default()
+        };
+        let manager = MultiTokenManager::new(config.clone(), vec![original], None, Some(path.clone()), true).unwrap();
+        let stale = manager.traffic_status()[0].settings.clone();
+        // A different editor changes the tier after the batch has started.
+        manager.set_credential_traffic(1, CredentialTraffic { tier: Some(AccountTier::Student), ..stale }).unwrap();
+        let permit = manager.try_acquire_permit(1).unwrap();
+        let mut expected: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        expected[0]["traffic"]["concurrency"] = serde_json::Value::Null;
+        expected[0]["traffic"]["rpm"] = serde_json::Value::Null;
+        manager.restore_credential_traffic_limits(1).unwrap();
+        let status = manager.traffic_status();
+        assert_eq!(status[0].settings, CredentialTraffic { tier: Some(AccountTier::Student), ..Default::default() });
+        assert_eq!((status[0].effective.concurrency, status[0].effective.rpm), (20, 10));
+        assert_eq!((status[0].concurrency, status[0].rpm), (1, 1));
+        let saved = std::fs::read(&path).unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&saved).unwrap(), expected);
+        manager.restore_credential_traffic_limits(1).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), saved); // Safe to retry.
+        let restarted = MultiTokenManager::new(config, serde_json::from_slice(&saved).unwrap(), None, Some(path), true).unwrap();
+        assert_eq!(restarted.traffic_status()[0].settings, status[0].settings);
+        drop(permit);
+        assert_eq!(manager.traffic_status()[0].concurrency, 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn traffic_restore_limits_preserves_all_tiers_and_auto_detection() {
+        use crate::kiro::traffic::AccountTier;
+        let manager = rpm_test_manager(false, 60);
+        for tier in [None, Some(AccountTier::Free), Some(AccountTier::Pro), Some(AccountTier::ProPlus),
+            Some(AccountTier::Max), Some(AccountTier::Power), Some(AccountTier::Student), Some(AccountTier::Unknown)] {
+            let settings = CredentialTraffic { tier, concurrency: Some(0), rpm: Some(100) };
+            manager.set_credential_traffic(1, settings.clone()).unwrap();
+            assert_eq!(manager.traffic_status()[0].settings, settings); // PUT still replaces all fields.
+            manager.restore_credential_traffic_limits(1).unwrap();
+            assert_eq!(manager.traffic_status()[0].settings, CredentialTraffic { tier, ..Default::default() });
+        }
+    }
+
+    #[test]
+    fn traffic_restore_limits_storage_failure_and_missing_id_do_not_mutate_settings() {
+        let (dir, path) = issue51_credentials_path("traffic_restore_limits_failure");
+        let manager = MultiTokenManager::new(Config::default(), vec![KiroCredentials { id: Some(1), ..Default::default() }], None, Some(path.clone()), true).unwrap();
+        let settings = CredentialTraffic { concurrency: Some(150), rpm: Some(100), ..Default::default() };
+        manager.set_credential_traffic(1, settings.clone()).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        assert!(manager.restore_credential_traffic_limits(999).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let error = manager.restore_credential_traffic_limits(1).unwrap_err();
+        assert!(error.downcast_ref::<TrafficStorageError>().is_some());
+        assert_eq!(manager.traffic_status()[0].settings, settings);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn traffic_failed_storage_preserves_settings_and_account_state() {
+        let (dir, path) = issue51_credentials_path("traffic_failed_storage");
+        let manager = MultiTokenManager::new(Config::default(), vec![KiroCredentials { id: Some(1), ..Default::default() }], None, Some(path.clone()), true).unwrap();
+        // A directory where a credential file should be makes the atomic rename fail.
+        if path.exists() { std::fs::remove_file(&path).unwrap(); }
+        std::fs::create_dir(&path).unwrap();
+        let identity = manager.balance_identity(1).unwrap();
+        let error = manager.set_credential_traffic(1, CredentialTraffic { rpm: Some(100), ..Default::default() }).unwrap_err();
+        assert!(error.downcast_ref::<TrafficStorageError>().is_some());
+        assert_eq!(manager.traffic_status()[0].settings.rpm, None);
+        assert!(manager.apply_traffic_quota(1, &identity, true).is_err());
+        assert!(!manager.snapshot().entries[0].disabled);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn traffic_quota_result_cannot_disable_a_replaced_account() {
+        let manager = rpm_test_manager(false, 60);
+        let identity = manager.balance_identity(1).unwrap();
+        manager.entries.lock()[0].credentials.refresh_token = Some("replacement".repeat(20));
+        assert!(manager.apply_traffic_quota(1, &identity, true).is_err());
+        assert!(!manager.snapshot().entries[0].disabled);
+        let current = manager.balance_identity(1).unwrap();
+        manager.apply_traffic_quota(1, &current, true).unwrap();
+        assert!(manager.snapshot().entries[0].disabled);
+    }
+
+    #[test]
+    fn traffic_missing_config_does_not_recreate_defaults() {
+        let (dir, path) = issue51_credentials_path("traffic_missing_config");
+        let config_path = dir.join("config.json");
+        let config = Config::load(&config_path).unwrap(); config.save().unwrap();
+        let manager = MultiTokenManager::new(config, vec![], None, Some(path), true).unwrap();
+        std::fs::remove_file(&config_path).unwrap();
+        let mut policy = manager.traffic_policies(); policy.default_concurrency = 30;
+        assert!(manager.set_traffic_policies(policy).is_err());
+        assert_eq!(manager.traffic_policies().default_concurrency, 0);
+        assert!(!config_path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn traffic_concurrent_admission_and_release_are_exact() {
+        let manager = Arc::new(rpm_test_manager(false, 60));
+        manager.set_credential_traffic(1, CredentialTraffic { concurrency: Some(2), rpm: Some(5), ..Default::default() }).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(21));
+        let threads: Vec<_> = (0..20).map(|_| {
+            let manager = manager.clone(); let barrier = barrier.clone();
+            std::thread::spawn(move || { barrier.wait(); manager.try_acquire_permit(1) })
+        }).collect();
+        barrier.wait();
+        let permits: Vec<_> = threads.into_iter().filter_map(|t| t.join().unwrap()).collect();
+        assert_eq!(permits.len(), 2);
+        assert_eq!(manager.traffic_status()[0].concurrency, 2);
+        assert_eq!(manager.traffic_status()[0].rpm, 2);
+        manager.set_credential_traffic(1, CredentialTraffic { concurrency: Some(1), rpm: Some(5), ..Default::default() }).unwrap();
+        assert!(manager.try_acquire_permit(1).is_none());
+        drop(permits);
+        assert_eq!(manager.traffic_status()[0].concurrency, 0);
+        for _ in 0..3 { drop(manager.try_acquire_permit(1).unwrap()); }
+        assert!(manager.try_acquire_permit(1).is_none());
+        // A policy edit must not erase the last minute of requests.
+        manager.set_credential_traffic(1, CredentialTraffic { rpm: Some(3), ..Default::default() }).unwrap();
+        assert_eq!(manager.traffic_status()[0].rpm, 5);
+        assert!(manager.try_acquire_permit(1).is_none());
+    }
+
+    #[test]
+    fn traffic_policies_and_overrides_survive_restart_and_new_credentials() {
+        use crate::kiro::traffic::{AccountTier, Limits};
+        let (dir, path) = issue51_credentials_path("traffic_persistence");
+        let config_path = dir.join("config.json");
+        let config = Config::load(&config_path).unwrap(); config.save().unwrap();
+        let credential = KiroCredentials { id: Some(1), subscription_title: Some("KIRO POWER".into()), ..Default::default() };
+        let manager = MultiTokenManager::new(config, vec![credential], None, Some(path.clone()), true).unwrap();
+        let mut policies = manager.traffic_policies();
+        policies.tiers.insert(AccountTier::Power, Limits { concurrency: Some(300), rpm: Some(200) });
+        manager.set_traffic_policies(policies.clone()).unwrap();
+        assert_eq!(manager.traffic_status()[0].effective.rpm, 200);
+        manager.set_credential_traffic(1, CredentialTraffic { concurrency: Some(150), rpm: Some(100), ..Default::default() }).unwrap();
+        policies.tiers.insert(AccountTier::Power, Limits { concurrency: Some(200), rpm: Some(80) });
+        manager.set_traffic_policies(policies).unwrap();
+        let mut credentials: Vec<KiroCredentials> = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        credentials.push(KiroCredentials { id: Some(2), subscription_title: Some("KIRO POWER".into()), ..Default::default() });
+        let restarted = MultiTokenManager::new(Config::load(&config_path).unwrap(), credentials, None, Some(path), true).unwrap();
+        let status = restarted.traffic_status();
+        assert_eq!((status[0].effective.concurrency, status[0].effective.rpm), (150, 100));
+        assert_eq!((status[1].effective.concurrency, status[1].effective.rpm), (200, 80));
+        restarted.set_credential_traffic(1, Default::default()).unwrap();
+        assert_eq!(restarted.traffic_status()[0].effective.rpm, 80);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn traffic_partial_policy_edits_preserve_other_types_and_validate_atomically() {
+        use crate::kiro::traffic::{AccountTier, Limits, TrafficPolicyPatch};
+        let manager = rpm_test_manager(false, 60);
+        for (tier, concurrency, rpm) in [(AccountTier::Power, 300, 200), (AccountTier::Max, 100, 50)] {
+            manager.patch_traffic_policies(TrafficPolicyPatch {
+                tiers: [(tier, Limits { concurrency: Some(concurrency), rpm: Some(rpm) })].into(), ..Default::default()
+            }).unwrap();
+        }
+        let invalid = manager.patch_traffic_policies(TrafficPolicyPatch {
+            default_concurrency: Some(100_001), auto_disable_quota: Some(false), ..Default::default()
+        });
+        assert!(invalid.is_err());
+        let policy = manager.traffic_policies();
+        assert_eq!(policy.tiers[&AccountTier::Power].rpm, Some(200));
+        assert_eq!(policy.tiers[&AccountTier::Max].rpm, Some(50));
+        assert!(policy.auto_disable_quota);
+    }
+
+    #[test]
+    fn traffic_token_refresh_preserves_concurrent_policy_and_tier_edits() {
+        let manager = rpm_test_manager(false, 60);
+        let mut old = manager.entries.lock()[0].credentials.clone();
+        old.access_token = Some("rotated-token".into());
+        manager.set_credential_traffic(1, CredentialTraffic { concurrency: Some(150), rpm: Some(100), ..Default::default() }).unwrap();
+        let mut entries = manager.entries.lock();
+        entries[0].credentials.subscription_title = Some("KIRO POWER".into());
+        entries[0].replace_refreshed_credentials(&old.clone(), old);
+        assert_eq!(entries[0].credentials.traffic.rpm, Some(100));
+        assert_eq!(entries[0].credentials.subscription_title.as_deref(), Some("KIRO POWER"));
+        assert_eq!(entries[0].credentials.access_token.as_deref(), Some("rotated-token"));
+    }
+
+    #[test]
+    fn traffic_disabled_quota_automation_preserves_enabled_state() {
+        let manager = rpm_test_manager(false, 60);
+        let mut policies = manager.traffic_policies(); policies.auto_disable_quota = false;
+        manager.set_traffic_policies(policies).unwrap();
+        manager.report_quota_exhausted(1);
+        assert!(!manager.snapshot().entries[0].disabled);
+        assert!(manager.traffic_status()[0].concurrency == 0);
+    }
+
     /// 构造一个仅含单凭据、可配置 RPM 限流的测试用 manager。
     fn rpm_test_manager(enabled: bool, limit: u32) -> MultiTokenManager {
         let mut config = Config::default();
@@ -4918,14 +5292,14 @@ mod tests {
     #[test]
     fn rpm_disabled_never_exceeds() {
         let mgr = rpm_test_manager(false, 1);
-        // 即使反复记录也不应触发限流（关闭时 record 直接清空窗口）
+        // 关闭限流仍统计 RPM，但不拦截请求。
         for _ in 0..10 {
             mgr.record_request(1);
         }
         let entries = mgr.entries.lock();
         let entry = &entries[0];
         assert!(!mgr.rpm_exceeded(entry, Instant::now()));
-        assert!(entry.rpm_window.is_empty());
+        assert_eq!(entry.rpm_window.len(), 10);
     }
 
     #[test]
@@ -7582,6 +7956,7 @@ mod tests {
 
         let first_context = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(first_context.id, 1);
+        drop(manager.try_acquire_permit(first_context.id).unwrap());
 
         let fallback_context = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(fallback_context.id, 2);
@@ -7697,8 +8072,9 @@ mod tests {
             .unwrap();
         assert_eq!(ctx.id, 1);
         manager.bind_session("s", 1);
+        drop(manager.try_acquire_permit(ctx.id).unwrap());
 
-        // #1 RPM 已满（limit=1，上一次 acquire 已计入）→ 粘性不可用 → 落到 #2
+        // #1 RPM 已满（limit=1，上一次发送已计入）→ 粘性不可用 → 落到 #2
         let (ctx, route) = manager
             .acquire_context_routed(None, None, Some("s"))
             .await
@@ -8058,5 +8434,65 @@ mod tests {
 
         // 但 g2 仍可用
         assert!(manager.acquire_context(None, Some("g2")).await.is_ok());
+    }
+}
+
+#[cfg(test)]
+impl MultiTokenManager {
+    /// Simulate a successful OAuth response through the production refresh writeback.
+    pub(crate) fn rotate_balance_token_for_test(&self, id: u64) {
+        let mut entries = self.entries.lock();
+        let entry = entries.iter_mut().find(|entry| entry.id == id).unwrap();
+        let source = entry.credentials.clone();
+        let mut refreshed = source.clone();
+        refreshed.refresh_token = Some("rotated-fixture-".repeat(12));
+        refreshed.access_token = Some("rotated-access".into());
+        entry.replace_refreshed_credentials(&source, refreshed);
+    }
+}
+
+#[cfg(test)]
+mod traffic_balance_generation_tests {
+    use super::*;
+    fn manager() -> MultiTokenManager {
+        MultiTokenManager::new(Config::default(), vec![KiroCredentials {
+            id: Some(1), refresh_token: Some("original-fixture-".repeat(12)), ..Default::default()
+        }], None, None, false).unwrap()
+    }
+
+    #[test]
+    fn stale_refresh_does_not_revalidate_old_balance_results() {
+        let manager = manager();
+        let original = manager.balance_identity(1).unwrap();
+        let source = manager.entries.lock()[0].credentials.clone();
+        manager.set_disabled(1, true).unwrap();
+        manager.update_refresh_token(1, "replacement-fixture-".repeat(12), None, None).unwrap();
+        let replacement = manager.balance_identity(1).unwrap();
+        let mut stale_response = source.clone();
+        stale_response.refresh_token = Some("rotated-stale-fixture-".repeat(12));
+        manager.entries.lock()[0].replace_refreshed_credentials(&source, stale_response);
+        assert!(manager.apply_traffic_quota(1, &original, true).is_err());
+        assert!(manager.apply_traffic_quota(1, &replacement, true).is_err());
+    }
+
+    #[test]
+    fn recreated_entry_cannot_reuse_old_quota_identity() {
+        let previous = manager();
+        let recreated = manager();
+        let identity = previous.balance_identity(1).unwrap();
+        assert!(recreated.apply_traffic_quota(1, &identity, true).is_err());
+        assert!(!recreated.snapshot().entries[0].disabled);
+    }
+
+    #[test]
+    fn traffic_edits_and_normal_rotation_preserve_balance_generation() {
+        let manager = manager();
+        let identity = manager.balance_identity(1).unwrap();
+        manager.set_credential_traffic(1, CredentialTraffic { rpm: Some(100), concurrency: Some(150), ..Default::default() }).unwrap();
+        manager.rotate_balance_token_for_test(1);
+        assert_eq!(manager.balance_identity(1).unwrap(), identity);
+        assert_eq!(manager.traffic_status()[0].effective.rpm, 100);
+        manager.apply_traffic_quota(1, &identity, true).unwrap();
+        assert!(manager.snapshot().entries[0].disabled);
     }
 }

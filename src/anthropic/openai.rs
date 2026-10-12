@@ -440,8 +440,8 @@ pub(super) struct ParsedResponse {
     pub(super) prompt_tokens: i64,
     pub(super) cached_tokens: i64,
     pub(super) completion_tokens: i64,
-    /// 思考文本（content 里的 thinking 块 + web_search loop 的顶层
-    /// `kiro_thinking` 带外字段）。chat/completions 路径不消费，
+    /// 思考文本（content 里的 thinking 块 + 兼容旧版顶层
+    /// `kiro_thinking` 带外字段）。Chat 使用 reasoning_content，
     /// Responses 路径渲染为 reasoning summary item。
     pub(super) thinking: String,
     /// 内部代答的 web_search 展示（server_tool_use 块）：(id, query)。
@@ -516,7 +516,7 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
         }
     }
 
-    // web_search loop 的带外思考文本（不进 content，避免 Anthropic 客户端回放）
+    // 兼容旧版 web_search loop 的带外思考文本。新版直接使用 thinking 块。
     if let Some(t) = anthropic.get("kiro_thinking").and_then(|v| v.as_str()) {
         if !t.is_empty() {
             if !thinking.is_empty() {
@@ -611,6 +611,9 @@ fn build_completion_json(p: &ParsedResponse) -> Value {
     };
 
     let mut message = json!({ "role": "assistant", "content": content });
+    if !p.thinking.is_empty() {
+        message["reasoning_content"] = json!(p.thinking);
+    }
     if !p.tool_calls.is_empty() {
         message["tool_calls"] = Value::Array(p.tool_calls.clone());
     }
@@ -695,11 +698,13 @@ impl ChatStreamContext {
                         )]
                     }
                     Some("text") if block["text"].as_str().is_some_and(|s| !s.is_empty()) => vec![self.chunk(json!({"content": block["text"]}), None, None)],
+                    Some("thinking") if block["thinking"].as_str().is_some_and(|s| !s.is_empty()) => vec![self.chunk(json!({"reasoning_content": block["thinking"]}), None, None)],
                     _ => Vec::new(),
                 }
             }
             "content_block_delta" => match data["delta"]["type"].as_str() {
                 Some("text_delta") => vec![self.chunk(json!({"content": data["delta"]["text"]}), None, None)],
+                Some("thinking_delta") => vec![self.chunk(json!({"reasoning_content": data["delta"]["thinking"]}), None, None)],
                 Some("input_json_delta") => match self.tools.get(&index) {
                     Some(tool_index) => vec![self.chunk(json!({"tool_calls": [{"index": tool_index, "function": {"arguments": data["delta"]["partial_json"]}}]}), None, None)],
                     None => self.fail(json!({"type": "api_error", "message": "Upstream tool delta has no matching tool"})),
@@ -1021,6 +1026,23 @@ mod tests {
             credit_unit: None,
             credit_unit_plural: None,
         }
+    }
+
+    #[test]
+    fn build_completion_separates_reasoning_from_answer_and_tools() {
+        let mut p = base_parsed();
+        p.thinking = "reasoning".to_string();
+        let out = build_completion_json(&p);
+        assert_eq!(out["choices"][0]["message"]["reasoning_content"], "reasoning");
+        assert_eq!(out["choices"][0]["message"]["content"], "hi");
+        p.text.clear();
+        p.tool_calls.push(json!({"id":"tool", "type":"function", "function":{"name":"run", "arguments":"{}"}}));
+        let out = build_completion_json(&p);
+        assert!(out["choices"][0]["message"]["content"].is_null());
+        assert_eq!(out["choices"][0]["message"]["tool_calls"], json!(p.tool_calls));
+        assert_eq!(out["usage"]["completion_tokens"], 11);
+        let normal = build_completion_json(&base_parsed());
+        assert!(normal["choices"][0]["message"].get("reasoning_content").is_none());
     }
 
     #[test]

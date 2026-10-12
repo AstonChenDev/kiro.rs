@@ -1,3 +1,4 @@
+import type { CredentialTraffic } from '@/api/traffic'
 // 凭据状态响应
 export interface CredentialsStatusResponse {
   total: number
@@ -176,6 +177,7 @@ export interface SetPriorityRequest {
 
 // 添加凭据请求
 export interface AddCredentialRequest {
+  traffic?: Partial<CredentialTraffic>
   refreshToken?: string
   accessToken?: string
   profileArn?: string

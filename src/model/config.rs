@@ -71,6 +71,8 @@ pub struct CustomModel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
+    #[serde(default)]
+    pub traffic_policies: crate::kiro::traffic::TrafficPolicies,
     #[serde(default = "default_host")]
     pub host: String,
 
@@ -107,6 +109,10 @@ pub struct Config {
 
     #[serde(default = "default_tls_backend")]
     pub tls_backend: TlsBackend,
+
+    /// Total deadline for one upstream API request, including its response body.
+    #[serde(default = "default_upstream_request_timeout_secs")]
+    pub upstream_request_timeout_secs: u64,
 
     /// Deadline for establishing an upstream API connection.
     #[serde(default = "default_upstream_connect_timeout_secs")]
@@ -365,6 +371,9 @@ fn default_tls_backend() -> TlsBackend {
 fn default_upstream_connect_timeout_secs() -> u64 {
     15
 }
+fn default_upstream_request_timeout_secs() -> u64 {
+    1200
+}
 fn default_upstream_read_timeout_secs() -> u64 {
     120
 }
@@ -452,6 +461,7 @@ fn default_usage_log_retention_days() -> u32 {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            traffic_policies: Default::default(),
             host: default_host(),
             port: default_port(),
             region: default_region(),
@@ -463,6 +473,7 @@ impl Default for Config {
             system_version: default_system_version(),
             node_version: default_node_version(),
             tls_backend: default_tls_backend(),
+            upstream_request_timeout_secs: default_upstream_request_timeout_secs(),
             upstream_connect_timeout_secs: default_upstream_connect_timeout_secs(),
             upstream_read_timeout_secs: default_upstream_read_timeout_secs(),
             count_tokens_api_url: None,
@@ -565,6 +576,47 @@ impl Config {
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }
+
+    pub(crate) fn load_traffic_config(path: &Path) -> anyhow::Result<Self> {
+        let text = fs::read_to_string(path).context("读取流量策略配置失败")?;
+        let mut config: Self = serde_json::from_str(&text).context("解析流量策略配置失败")?;
+        config.config_path = Some(path.to_path_buf());
+        Ok(config)
+    }
+
+    pub(crate) fn save_traffic_config(&self) -> anyhow::Result<()> {
+        let path = self
+            .config_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
+
+        let resolved = if path.is_symlink() { fs::canonicalize(path)? } else { path.to_path_buf() };
+        let path = resolved.as_path();
+        let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
+        // Commit a complete file so a failed policy save cannot truncate live config.
+        let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temporary)?;
+            if let Ok(metadata) = fs::metadata(path) { file.set_permissions(metadata.permissions())?; }
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temporary, path)
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_file(&temporary);
+            return Err(error).with_context(|| format!("写入配置文件失败: {}", path.display()));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -576,6 +628,7 @@ mod tests {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(config.upstream_connect_timeout_secs, 15);
         assert_eq!(config.upstream_read_timeout_secs, 120);
+        assert_eq!(config.upstream_request_timeout_secs, 1200);
         assert_eq!(Config::default().upstream_connect_timeout_secs, 15);
         assert_eq!(Config::default().upstream_read_timeout_secs, 120);
     }
@@ -583,11 +636,12 @@ mod tests {
     #[test]
     fn upstream_deadlines_accept_explicit_values() {
         let config: Config = serde_json::from_str(
-            r#"{"upstreamConnectTimeoutSecs":7,"upstreamReadTimeoutSecs":45}"#,
+            r#"{"upstreamConnectTimeoutSecs":7,"upstreamReadTimeoutSecs":45,"upstreamRequestTimeoutSecs":1200}"#,
         )
         .unwrap();
         assert_eq!(config.upstream_connect_timeout_secs, 7);
         assert_eq!(config.upstream_read_timeout_secs, 45);
+        assert_eq!(config.upstream_request_timeout_secs, 1200);
     }
 
     #[test]

@@ -75,8 +75,7 @@ struct RoundOutcome {
     /// Accumulated assistant text
     text: String,
     /// Accumulated thinking / reasoning text (Kiro reasoningContentEvent).
-    /// Surfaced out-of-band via render_json's `kiro_thinking` so Anthropic
-    /// clients never see (and never replay) an unsigned thinking block.
+    /// Rendered as a separate thinking block, independently of request flags.
     thinking: String,
     /// The complete tool_use for this round (name already restored via tool_name_map)
     tool_uses: Vec<CompletedToolUse>,
@@ -245,12 +244,12 @@ fn empty_tool_result_disposition(
 
 /// Buffer-decode one round of the upstream streaming response
 async fn decode_round(
-    response: reqwest::Response,
+    response: crate::kiro::traffic::LimitedResponse,
     model: &str,
     tool_name_map: &std::collections::HashMap<String, String>,
     tracer: &RequestTracer,
 ) -> RoundOutcome {
-    let mut body_stream = response.bytes_stream();
+    let mut body_stream = Box::pin(response.bytes_stream());
     let mut decoder = EventStreamDecoder::new();
 
     let mut text = String::new();
@@ -312,6 +311,9 @@ async fn decode_round(
                     entry.1.push_str(&tu.input);
                 }
                 Event::Metadata(metadata) => {
+                    if let Some(reason) = metadata.stop_reason_override() {
+                        stop_reason_override = Some(reason.to_string());
+                    }
                     if let Some(usage) = metadata.token_usage {
                         // 单条流内重复 metadata 是快照，取最后一份。
                         provider_token_usage = Some(usage.sanitized());
@@ -401,6 +403,7 @@ async fn run_round(
         Ok(c) => c,
         Err(e) => {
             let (et, msg) = match &e {
+                ConversionError::InvalidMaxTokens(reason) => ("invalid_request_error", reason.clone()),
                 ConversionError::InvalidModel(reason) => (
                     "invalid_request_error",
                     format!("invalid model id: {}", reason),
@@ -1012,20 +1015,9 @@ impl WebSearchSseEmitter {
         thinking: &str,
         metering: Option<&MeteringEvent>,
     ) {
-        let content = without_web_search_presentation(content);
-        let (mut events, next_index) = build_sse_content_events(&content, self.next_block_index);
+        let content = with_thinking_block(without_web_search_presentation(content), thinking);
+        let (events, next_index) = build_sse_content_events(&content, self.next_block_index);
         self.next_block_index = next_index;
-        // Keep the extension on a standard Anthropic event so ordinary Messages
-        // clients can ignore the unknown field. Responses consumes it before
-        // translating that event, which puts reasoning ahead of final answer/tools.
-        let reasoning_attached_to_content = if thinking.is_empty() {
-            false
-        } else if let Some(first) = events.first_mut() {
-            first.data["kiro_thinking"] = json!(thinking);
-            true
-        } else {
-            false
-        };
         for event in events {
             self.send(event).await;
         }
@@ -1042,14 +1034,11 @@ impl WebSearchSseEmitter {
             usage["credit_unit"] = json!(metering.unit);
             usage["credit_unit_plural"] = json!(metering.unit_plural);
         }
-        let mut message_delta = json!({
+        let message_delta = json!({
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason},
             "usage": usage
         });
-        if !reasoning_attached_to_content && !thinking.is_empty() {
-            message_delta["kiro_thinking"] = json!(thinking);
-        }
         self.send(SseEvent::new("message_delta", message_delta))
             .await;
         self.send(SseEvent::new(
@@ -1625,13 +1614,20 @@ async fn run_web_search_loop_inner(
         .into_response()
 }
 
-/// Single JSON response (non-streaming)
-///
-/// `thinking`: optional out-of-band reasoning text. Emitted as a TOP-LEVEL
-/// `kiro_thinking` field (NOT a content block): Anthropic clients ignore
-/// unknown top-level fields and thus never replay an unsigned thinking block
-/// upstream, while the Responses translator picks it up for codex's
-/// reasoning-summary display.
+// Search rounds aggregate unsigned reasoning; retain the existing local signature
+// placeholder convention without claiming it is an upstream-verifiable signature.
+fn with_thinking_block(mut content: Vec<Value>, thinking: &str) -> Vec<Value> {
+    if !thinking.is_empty() {
+        content.insert(0, json!({
+            "type": "thinking",
+            "thinking": thinking,
+            "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
+        }));
+    }
+    content
+}
+
+/// Single JSON response (non-streaming), including a normal thinking content block.
 pub(crate) fn render_json(
     model: &str,
     content: Vec<Value>,
@@ -1654,19 +1650,16 @@ pub(crate) fn render_json(
         usage["credit_unit"] = json!(m.unit);
         usage["credit_unit_plural"] = json!(m.unit_plural);
     }
-    let mut body = json!({
+    let body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
         "type": "message",
         "role": "assistant",
-        "content": content,
+        "content": with_thinking_block(content, thinking),
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": usage
     });
-    if !thinking.is_empty() {
-        body["kiro_thinking"] = json!(thinking);
-    }
     (StatusCode::OK, Json(body)).into_response()
 }
 
@@ -1738,13 +1731,30 @@ fn build_sse_content_events(content: &[Value], start_index: i32) -> (Vec<SseEven
         let btype = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if !matches!(
             btype,
-            "text" | "tool_use" | "server_tool_use" | "web_search_tool_result"
+            "thinking" | "text" | "tool_use" | "server_tool_use" | "web_search_tool_result"
         ) {
             continue;
         }
         let index = next_index;
         next_index += 1;
         match btype {
+            "thinking" => {
+                events.push(SseEvent::new("content_block_start", json!({
+                    "type": "content_block_start", "index": index,
+                    "content_block": {"type": "thinking", "thinking": ""}
+                })));
+                events.push(SseEvent::new("content_block_delta", json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "thinking_delta", "thinking": block["thinking"]}
+                })));
+                events.push(SseEvent::new("content_block_delta", json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "signature_delta", "signature": block["signature"]}
+                })));
+                events.push(SseEvent::new("content_block_stop", json!({
+                    "type": "content_block_stop", "index": index
+                })));
+            }
             "text" => {
                 let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 events.push(SseEvent::new(
@@ -1989,7 +1999,7 @@ mod tests {
             .iter()
             .map(|data| data["index"].as_i64().unwrap())
             .collect();
-        assert_eq!(start_indexes, vec![0, 1, 2, 3]);
+        assert_eq!(start_indexes, vec![0, 1, 2, 3, 4]);
         assert_eq!(
             starts
                 .iter()
@@ -2012,7 +2022,7 @@ mod tests {
             .filter(|(event, _)| event == "content_block_stop")
             .map(|(_, data)| data["index"].as_i64().unwrap())
             .collect();
-        assert_eq!(stops, vec![0, 1, 2, 3]);
+        assert_eq!(stops, vec![0, 1, 2, 3, 4]);
 
         let delta = events
             .iter()
@@ -2027,7 +2037,7 @@ mod tests {
         assert_eq!(delta["usage"]["credit_usage"], json!(0.75));
         let reasoning_carrier = events
             .iter()
-            .find(|(_, data)| data["kiro_thinking"] == "search reasoning")
+            .find(|(_, data)| data["delta"]["type"] == "thinking_delta" && data["delta"]["thinking"] == "search reasoning")
             .expect("reasoning must be attached before final visible content");
         let reasoning_position = events
             .iter()

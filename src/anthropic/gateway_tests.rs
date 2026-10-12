@@ -54,13 +54,20 @@ enum Mode {
     SlowErrorBody,
     MetadataFirst,
     Active,
+    OutputLimit,
+    NativeReasoning,
+    NativeReasoningOnly,
+    NativeReasoningTools,
 }
 
 struct Fixture {
+    manager: Arc<MultiTokenManager>,
+    provider: Arc<KiroProvider>,
     state: AppState,
     calls: Arc<AtomicUsize>,
     connections: Arc<Mutex<HashSet<SocketAddr>>>,
     close_headers: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Fixture {
@@ -127,11 +134,15 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
     let calls = Arc::new(AtomicUsize::new(0));
     let connections = Arc::new(Mutex::new(HashSet::new()));
     let close_headers = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let seen_requests = requests.clone();
     let (seen_calls, seen_connections, seen_close) =
         (calls.clone(), connections.clone(), close_headers.clone());
-    let app = Router::new().route("/", post(move |ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap| {
+    let app = Router::new().route("/", post(move |ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Json(body): Json<serde_json::Value>| {
         let (calls, connections, close) = (seen_calls.clone(), seen_connections.clone(), seen_close.clone());
+        let requests = seen_requests.clone();
         async move {
+            requests.lock().push(body);
             calls.fetch_add(1, Ordering::Relaxed);
             connections.lock().insert(peer);
             if headers.get("connection").is_some_and(|v| v == "close") { close.fetch_add(1, Ordering::Relaxed); }
@@ -151,6 +162,28 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                 let mut bytes = frame("assistantResponseEvent", json!({"content": "damaged"})).to_vec();
                 if matches!(mode, Mode::Truncated) { bytes.truncate(bytes.len() - 4); }
                 else { let last = bytes.len() - 1; bytes[last] ^= 1; }
+                return Response::new(Body::from(bytes));
+            }
+            if matches!(mode, Mode::OutputLimit) {
+                let mut bytes = Vec::new();
+                for part in [
+                    frame("assistantResponseEvent", json!({"content": "unfinished sentence"})),
+                    frame("metadataEvent", json!({"stopReason":"MAX_TOKENS"})),
+                    // Usage/normal metadata must not erase the earlier truncation reason.
+                    frame("metadataEvent", json!({"stopReason":"END_TURN", "tokenUsage":{"outputTokens":1024}})),
+                ] { bytes.extend_from_slice(&part); }
+                return Response::new(Body::from(bytes));
+            }
+            if matches!(mode, Mode::NativeReasoning | Mode::NativeReasoningOnly | Mode::NativeReasoningTools) {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&frame("reasoningContentEvent", json!({"text":"fixture reasoning", "signature":"fixture-signature"})));
+                if !matches!(mode, Mode::NativeReasoningOnly) {
+                    bytes.extend_from_slice(&frame("assistantResponseEvent", json!({"content":"fixture answer"})));
+                }
+                if matches!(mode, Mode::NativeReasoningTools) {
+                    bytes.extend_from_slice(&frame("toolUseEvent", json!({"name":"run", "toolUseId":"call_1", "input":"{\"command\":\"hello\"}", "stop":true})));
+                }
+                bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}})));
                 return Response::new(Body::from(bytes));
             }
             if matches!(mode, Mode::Tools) {
@@ -198,14 +231,17 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
         "fixture".to_owned(),
         Arc::new(LocalEndpoint(url)) as Arc<dyn KiroEndpoint>,
     )]);
-    let provider = KiroProvider::with_proxy(manager, None, endpoints, "fixture".to_owned());
+    let provider = Arc::new(KiroProvider::with_proxy(manager.clone(), None, endpoints, "fixture".to_owned()));
     let state = AppState::new(false, ToolCompatibilityMode::Raw)
-        .with_shared_kiro_provider(Arc::new(provider));
+        .with_shared_kiro_provider(provider.clone());
     Fixture {
+        provider,
+        manager,
         state,
         calls,
         connections,
         close_headers,
+        requests,
         task,
     }
 }
@@ -220,6 +256,10 @@ fn key() -> KeyContext {
 }
 async fn request(state: AppState, endpoint: &str, streaming: bool) -> Response {
     let req = json!({"model": "gpt-5.6-sol", "max_tokens": 64, "stream": streaming, "messages": [{"role": "user", "content": "hello"}], "input": [{"role":"user", "content":"hello"}]});
+    request_payload(state, endpoint, req).await
+}
+
+async fn request_payload(state: AppState, endpoint: &str, req: serde_json::Value) -> Response {
     if endpoint == "chat" {
         post_chat_completions(
             axum::extract::State(state),
@@ -262,6 +302,181 @@ async fn first_content(
         }
     }
     panic!("stream ended without content");
+}
+
+/// Model-independent output typing must not depend on a request-side thinking flag.
+#[tokio::test]
+async fn gateway_native_reasoning_stays_separate_across_models_and_protocols() {
+    for model in ["claude-opus-5-5", "claude-opus-4-6", "claude-sonnet-4-6", "gpt-5.6-sol"] {
+        for endpoint in ["messages", "cc", "chat", "responses"] {
+            for streaming in [false, true] {
+                for mode in [Mode::NativeReasoning, Mode::NativeReasoningOnly, Mode::NativeReasoningTools] {
+                    for search_loop in [false, true] {
+                        if search_loop && (model != "claude-opus-5-5" || endpoint == "chat") {
+                            continue;
+                        }
+                        let f = fixture(mode).await;
+                        let mut req = json!({
+                            "model":model, "stream":streaming,
+                            "max_tokens":2048, "max_output_tokens":2048,
+                            "messages":[{"role":"user", "content":"hello"}], "input":"hello"
+                        });
+                        if endpoint == "messages" || endpoint == "cc" {
+                            // Explicitly disabled must not downgrade an event the upstream still sends.
+                            req["thinking"] = json!({"type":"disabled"});
+                        }
+                        if search_loop {
+                            req["tools"] = match endpoint {
+                                "chat" => json!([
+                                    {"type":"function", "function":{"name":"web_search", "parameters":{"type":"object"}}},
+                                    {"type":"function", "function":{"name":"run", "parameters":{"type":"object"}}}
+                                ]),
+                                "responses" => json!([
+                                    {"type":"web_search"},
+                                    {"type":"function", "name":"run", "parameters":{"type":"object"}}
+                                ]),
+                                _ => json!([
+                                    {"type":"web_search_20250305", "name":"web_search"},
+                                    {"name":"run", "input_schema":{"type":"object"}}
+                                ]),
+                            };
+                        }
+                        let response = request_payload(f.state.clone(), endpoint, req).await;
+                        assert_eq!(response.status(), StatusCode::OK, "{model} {endpoint} stream={streaming}");
+                        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                        let expected_text = if matches!(mode, Mode::NativeReasoningOnly) { "" } else { "fixture answer" };
+                        let tool_count = usize::from(matches!(mode, Mode::NativeReasoningTools));
+                        if streaming {
+                            let body = String::from_utf8(body.to_vec()).unwrap();
+                            let events: Vec<serde_json::Value> = body.lines()
+                                .filter_map(|l| l.strip_prefix("data: "))
+                                .filter(|v| *v != "[DONE]")
+                                .map(|v| serde_json::from_str(v).unwrap()).collect();
+                            let (text, reasoning, tools, output_tokens) = match endpoint {
+                                "chat" => (
+                                    events.iter().filter_map(|v| v.pointer("/choices/0/delta/content").and_then(|v| v.as_str())).collect::<String>(),
+                                    events.iter().filter_map(|v| v.pointer("/choices/0/delta/reasoning_content").and_then(|v| v.as_str())).collect::<String>(),
+                                    events.iter().filter(|v| v.pointer("/choices/0/delta/tool_calls/0/id").is_some()).count(),
+                                    events.last().unwrap()["usage"]["completion_tokens"].clone(),
+                                ),
+                                "responses" => (
+                                    events.iter().filter(|v| v["type"] == "response.output_text.delta").filter_map(|v| v["delta"].as_str()).collect(),
+                                    events.iter().filter(|v| v["type"] == "response.reasoning_summary_text.delta").filter_map(|v| v["delta"].as_str()).collect(),
+                                    events.iter().filter(|v| v["type"] == "response.output_item.added" && v["item"]["type"] == "function_call").count(),
+                                    events.last().unwrap()["response"]["usage"]["output_tokens"].clone(),
+                                ),
+                                _ => (
+                                    events.iter().filter(|v| v["delta"]["type"] == "text_delta").filter_map(|v| v["delta"]["text"].as_str()).collect(),
+                                    events.iter().filter(|v| v["delta"]["type"] == "thinking_delta").filter_map(|v| v["delta"]["thinking"].as_str()).collect(),
+                                    events.iter().filter(|v| v["type"] == "content_block_start" && v["content_block"]["type"] == "tool_use").count(),
+                                    events.iter().find(|v| v["type"] == "message_delta").unwrap()["usage"]["output_tokens"].clone(),
+                                ),
+                            };
+                            assert_eq!(text, expected_text, "{model} {endpoint}: {body}");
+                            assert_eq!(reasoning, "fixture reasoning", "{model} {endpoint}: {body}");
+                            assert_eq!(tools, tool_count, "{endpoint}: {body}");
+                            assert_eq!(output_tokens, 17, "{endpoint}: {body}");
+                        } else {
+                            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                            match endpoint {
+                                "chat" => {
+                                    let message = &body["choices"][0]["message"];
+                                    assert_eq!(message["content"], expected_text);
+                                    assert_eq!(message["reasoning_content"], "fixture reasoning");
+                                    assert_eq!(message["tool_calls"].as_array().map_or(0, Vec::len), tool_count);
+                                    assert_eq!(body["usage"]["completion_tokens"], 17);
+                                }
+                                "responses" => {
+                                    let output = body["output"].as_array().unwrap();
+                                    let thinking: String = output.iter().filter(|v| v["type"] == "reasoning")
+                                        .filter_map(|v| v["summary"][0]["text"].as_str()).collect();
+                                    let text: String = output.iter().filter(|v| v["type"] == "message")
+                                        .filter_map(|v| v["content"][0]["text"].as_str()).collect();
+                                    assert_eq!(thinking, "fixture reasoning");
+                                    assert_eq!(text, expected_text);
+                                    assert_eq!(output.iter().filter(|v| v["type"] == "function_call").count(), tool_count);
+                                    assert_eq!(body["usage"]["output_tokens"], 17);
+                                }
+                                _ => {
+                                    let content = body["content"].as_array().unwrap();
+                                    assert_eq!(content[0]["type"], "thinking");
+                                    assert_eq!(content[0]["thinking"], "fixture reasoning");
+                                    assert_eq!(content[0]["signature"], if search_loop { super::stream::THINKING_SIGNATURE_PLACEHOLDER } else { "fixture-signature" });
+                                    let text: String = content.iter().filter(|v| v["type"] == "text").filter_map(|v| v["text"].as_str()).collect();
+                                    assert_eq!(text, expected_text);
+                                    assert_eq!(content.iter().filter(|v| v["type"] == "tool_use").count(), tool_count);
+                                    assert_eq!(body["usage"]["output_tokens"], 17);
+                                }
+                            }
+                        }
+                        let requests = f.requests.lock();
+                        assert_eq!(requests.len(), 1);
+                        let additional = &requests[0]["additionalModelRequestFields"];
+                        assert!(additional.get("output_config").is_none());
+                        assert!(additional.get("reasoning_effort").is_none());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_forwards_output_budget_and_preserves_limit_reason_across_protocols() {
+    for endpoint in ["messages", "cc", "chat", "responses"] {
+        for streaming in [false, true] {
+            for budget in [64000, 128000] {
+                let f = fixture(Mode::OutputLimit).await;
+                let req = json!({
+                    "model":"claude-opus-4-6", "stream":streaming,
+                    "max_tokens":budget, "max_output_tokens":budget,
+                    "messages":[{"role":"user", "content":"hello"}], "input":"hello"
+                });
+                let response = request_payload(f.state.clone(), endpoint, req).await;
+                assert_eq!(response.status(), StatusCode::OK, "{endpoint} stream={streaming}");
+                let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                let body = String::from_utf8(bytes.to_vec()).unwrap();
+                let expected = match endpoint {
+                    "chat" => "\"finish_reason\":\"length\"",
+                    "responses" => "\"status\":\"incomplete\"",
+                    _ => "\"stop_reason\":\"max_tokens\"",
+                };
+                assert!(body.contains(expected), "{endpoint} stream={streaming}: {body}");
+                assert!(body.contains("unfinished sentence"), "{body}");
+                let requests = f.requests.lock();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0]["additionalModelRequestFields"]["max_tokens"], 64000);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_rejects_unsupported_opus_budget_before_upstream_request() {
+    for endpoint in ["messages", "cc", "chat", "responses"] {
+        for budget in [1, 1023] {
+            let f = fixture(Mode::OutputLimit).await;
+            let mut req = json!({
+                "model":"claude-opus-4-6", "stream":true,
+                "max_tokens":budget, "max_output_tokens":budget,
+                "messages":[{"role":"user", "content":"hello"}], "input":"hello"
+            });
+            if endpoint == "messages" || endpoint == "cc" {
+                // Mixed tools normally enter an internal SSE search loop. Invalid
+                // budgets must still be rejected before sending its HTTP 200.
+                req["tools"] = json!([
+                    {"type":"web_search_20250305", "name":"web_search"},
+                    {"name":"run", "input_schema":{"type":"object", "properties":{}}}
+                ]);
+            }
+            let response = request_payload(f.state.clone(), endpoint, req).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{endpoint}");
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let body = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(body.contains("at least 1024"), "{endpoint}: {body}");
+            assert_eq!(f.calls.load(Ordering::Relaxed), 0);
+        }
+    }
 }
 
 #[tokio::test]
@@ -450,6 +665,7 @@ async fn gateway_stalled_body_times_out_without_normal_completion() {
     let text = String::from_utf8_lossy(&bytes);
     assert!(text.contains("event: error"));
     assert!(!text.contains("event: message_stop"));
+    assert_eq!(f.manager.traffic_status()[0].concurrency, 0);
 }
 
 #[tokio::test]
@@ -462,6 +678,7 @@ async fn gateway_header_timeout_does_not_repeat_long_waits() {
             .expect("header deadline was ignored or retried");
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(f.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(f.manager.traffic_status()[0].concurrency, 0);
 }
 
 #[tokio::test]
@@ -474,6 +691,7 @@ async fn gateway_error_body_timeout_does_not_repeat_long_waits() {
             .expect("error response body deadline was ignored or retried");
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(f.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(f.manager.traffic_status()[0].concurrency, 0);
 }
 
 #[tokio::test]
@@ -509,6 +727,26 @@ async fn gateway_active_stream_can_exceed_idle_deadline() {
 }
 
 #[tokio::test]
+async fn gateway_total_deadline_is_configurable_even_for_active_streams() {
+    for (total, should_finish) in [(1, false), (3, true)] {
+        let config: Config = serde_json::from_value(json!({
+            "upstreamRequestTimeoutSecs": total,
+            "upstreamReadTimeoutSecs": 5,
+        })).unwrap();
+        let f = fixture_with_config(Mode::Active, config).await;
+        let response = request(f.state.clone(), "messages", true).await;
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(4),
+            to_bytes(response.into_body(), 1024 * 1024),
+        ).await.expect("total deadline ignored").unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(text.contains("event: message_stop"), should_finish);
+        assert_eq!(text.contains("event: error"), !should_finish);
+        assert_eq!(f.manager.traffic_status()[0].concurrency, 0);
+    }
+}
+
+#[tokio::test]
 #[ignore = "controlled latency measurement; run with --ignored --nocapture"]
 async fn gateway_latency_measurement() {
     for endpoint in ["cc", "chat", "messages"] {
@@ -539,4 +777,53 @@ async fn gateway_latency_measurement() {
             f.calls.load(Ordering::Relaxed)
         );
     }
+}
+
+#[tokio::test]
+async fn gateway_traffic_streams_hold_permit_until_disconnect_or_eof() {
+    for endpoint in ["messages", "cc", "chat", "responses"] {
+        let mut config = Config::default();
+        config.traffic_policies.default_concurrency = 1;
+        let f = fixture_with_config(Mode::Normal(Duration::from_millis(150)), config).await;
+        let response = request(f.state.clone(), endpoint, true).await;
+        assert_eq!(response.status(), 200, "{endpoint}");
+        assert_eq!(f.manager.traffic_status()[0].concurrency, 1, "{endpoint}: headers must not release permit");
+        let blocked = request(f.state.clone(), endpoint, true).await;
+        assert_eq!(blocked.status(), 429, "{endpoint}");
+        assert_eq!(f.calls.load(Ordering::Relaxed), 1);
+        drop(response);
+        // Responses adapters may run a task that observes body cancellation asynchronously.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while f.manager.traffic_status()[0].concurrency != 0 { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let mut body = request(f.state.clone(), endpoint, true).await.into_body().into_data_stream();
+        while let Some(chunk) = body.next().await { chunk.unwrap(); }
+        assert_eq!(f.manager.traffic_status()[0].concurrency, 0, "{endpoint}: EOF releases permit");
+        assert_eq!(f.manager.traffic_status()[0].rpm, 2);
+    }
+}
+
+#[tokio::test]
+async fn gateway_traffic_non_stream_errors_release_permit() {
+    for mode in [Mode::Empty, Mode::Interrupted, Mode::InvalidFrame, Mode::Overloaded] {
+        let f = fixture(mode).await;
+        let _response = request(f.state.clone(), "messages", false).await;
+        assert_eq!(f.manager.traffic_status()[0].concurrency, 0);
+    }
+}
+
+#[tokio::test]
+async fn gateway_traffic_mcp_holds_permit_during_body_and_releases_on_drop() {
+    let mut config = Config::default();
+    config.traffic_policies.default_concurrency = 1;
+    let f = fixture_with_config(Mode::Normal(Duration::from_millis(20)), config).await;
+    let response = f.provider.call_mcp("{}", None).await.unwrap();
+    assert_eq!(f.manager.traffic_status()[0].concurrency, 1);
+    assert!(f.provider.call_mcp("{}", None).await.is_err());
+    drop(response);
+    assert_eq!(f.manager.traffic_status()[0].concurrency, 0);
+    let response = f.provider.call_mcp("{}", None).await.unwrap();
+    response.text().await.unwrap();
+    assert_eq!(f.manager.traffic_status()[0].concurrency, 0);
+    assert_eq!(f.manager.traffic_status()[0].rpm, 2);
 }

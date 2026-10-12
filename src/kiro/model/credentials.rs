@@ -410,6 +410,8 @@ pub fn validate_credential_metadata(
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroCredentials {
+    #[serde(default)]
+    pub traffic: crate::kiro::traffic::CredentialTraffic,
     /// 凭据唯一标识符（自增 ID）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
@@ -1241,6 +1243,7 @@ mod tests {
             groups: vec![],
             source_channel: None,
             metadata: CredentialMetadata::default(),
+            traffic: Default::default(),
             created_at: None,
         };
 
@@ -1518,6 +1521,7 @@ mod tests {
             groups: vec![],
             source_channel: None,
             metadata: CredentialMetadata::default(),
+            traffic: Default::default(),
             created_at: None,
         };
 
@@ -1563,6 +1567,7 @@ mod tests {
             groups: vec![],
             source_channel: None,
             metadata: CredentialMetadata::default(),
+            traffic: Default::default(),
             created_at: None,
         };
 
@@ -1691,6 +1696,7 @@ mod tests {
             groups: vec![],
             source_channel: None,
             metadata: CredentialMetadata::default(),
+            traffic: Default::default(),
             created_at: None,
         };
 
@@ -2098,3 +2104,7 @@ mod tests {
         assert!(!empty_json.contains("tokenEndpoint"));
     }
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct InvalidCredentialConfig(pub String);

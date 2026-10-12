@@ -1,3 +1,4 @@
+import type { CredentialTraffic } from '@/api/traffic'
 import { useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
@@ -35,6 +36,7 @@ interface BatchImportDialogProps {
 }
 
 interface CredentialInput {
+  traffic?: Partial<CredentialTraffic>
   refreshToken?: string
   clientId?: string
   clientSecret?: string
@@ -210,6 +212,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
               machineId: cred.machineId?.trim() || undefined,
+              traffic: cred.traffic,
               endpoint: cred.endpoint?.trim() || undefined,
               email: cred.email?.trim() || undefined,
               proxyUrl: cred.proxyUrl?.trim() || undefined,
@@ -266,6 +269,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               scopes: cred.scopes?.trim() || undefined,
               priority: cred.priority || 0,
               machineId: cred.machineId?.trim() || undefined,
+              traffic: cred.traffic,
               endpoint: cred.endpoint?.trim() || undefined,
               email: cred.email?.trim() || undefined,
               proxyUrl: cred.proxyUrl?.trim() || undefined,

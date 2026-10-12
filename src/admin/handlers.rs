@@ -1884,3 +1884,53 @@ pub async fn delete_group(
     )))
     .into_response()
 }
+
+// Traffic settings are authenticated Admin operations. PUT replaces the explicit settings;
+// null fields restore inheritance, while zero explicitly means unlimited.
+pub async fn traffic_policies(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.token_manager().traffic_policies())
+}
+pub async fn set_traffic_policies(State(state): State<AdminState>, Json(policy): Json<crate::kiro::traffic::TrafficPolicies>) -> Response {
+    match state.service.token_manager().set_traffic_policies(policy) {
+        Ok(()) => Json(state.service.token_manager().traffic_policies()).into_response(),
+        Err(e) => traffic_error(e),
+    }
+}
+pub async fn traffic_status(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.token_manager().traffic_status())
+}
+pub async fn set_credential_traffic(State(state): State<AdminState>, Path(id): Path<u64>, Json(settings): Json<crate::kiro::traffic::CredentialTraffic>) -> Response {
+    if state.service.token_manager().balance_identity(id).is_err() { return super::error::AdminServiceError::NotFound { id }.into_http_response(); }
+    match state.service.token_manager().set_credential_traffic(id, settings) {
+        Ok(()) => Json(serde_json::json!({"success": true})).into_response(),
+        Err(e) => traffic_error(e),
+    }
+}
+pub async fn start_balance_refresh(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.start_balance_refresh())
+}
+
+pub async fn restore_credential_traffic_limits(State(state): State<AdminState>, Path(id): Path<u64>) -> Response {
+    if state.service.token_manager().balance_identity(id).is_err() { return super::error::AdminServiceError::NotFound { id }.into_http_response(); }
+    match state.service.token_manager().restore_credential_traffic_limits(id) {
+        Ok(()) => Json(serde_json::json!({"success": true})).into_response(),
+        Err(e) => traffic_error(e),
+    }
+}
+pub async fn balance_refresh_status(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.balance_refresh_status())
+}
+
+pub async fn patch_traffic_policies(State(state): State<AdminState>, Json(patch): Json<crate::kiro::traffic::TrafficPolicyPatch>) -> Response {
+    match state.service.token_manager().patch_traffic_policies(patch) {
+        Ok(policy) => Json(policy).into_response(),
+        Err(e) => traffic_error(e),
+    }
+}
+
+fn traffic_error(error: anyhow::Error) -> Response {
+    use super::error::AdminServiceError;
+    if error.downcast_ref::<crate::kiro::token_manager::TrafficStorageError>().is_some() {
+        AdminServiceError::InternalError("流量策略保存失败，请检查本地存储".into()).into_http_response()
+    } else { AdminServiceError::InvalidRequest(error.to_string()).into_http_response() }
+}

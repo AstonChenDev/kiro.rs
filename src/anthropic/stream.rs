@@ -1412,6 +1412,10 @@ pub struct StreamContext {
     pub context_input_tokens: Option<i32>,
     /// 上游 metadataEvent.tokenUsage 的精确最终快照。
     pub provider_token_usage: Option<TokenUsage>,
+    /// Diagnostic counters contain no prompt or response contents.
+    upstream_stop_reason: Option<String>,
+    upstream_text_bytes: u64,
+    emitted_text_bytes: u64,
     /// 输出 tokens 累计
     pub output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
@@ -1428,7 +1432,7 @@ pub struct StreamContext {
     /// 围栏检测的「未完成行」累加器：只在遇到换行时才对完整行判定是否为 ``` 围栏行。
     /// 这样即使 ``` 分隔符被切分到多个 chunk（如 `` `` + ` ``），重组成完整行后仍能正确识别。
     pub fence_scan_partial: String,
-    /// thinking 是否启用
+    /// 是否解析旧式正文中的 <thinking> 标签；原生 reasoning 始终保留其类型。
     pub thinking_enabled: bool,
     /// thinking 内容缓冲区
     pub thinking_buffer: String,
@@ -1529,6 +1533,9 @@ impl StreamContext {
             input_tokens,
             context_input_tokens: None,
             provider_token_usage: None,
+            upstream_stop_reason: None,
+            upstream_text_bytes: 0,
+            emitted_text_bytes: 0,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
             tool_name_map,
@@ -1578,10 +1585,8 @@ impl StreamContext {
         })
     }
 
-    /// 生成初始事件序列 (message_start + 文本块 start)
-    ///
-    /// 当 thinking 启用时，不在初始化时创建文本块，而是等到实际收到内容时再创建。
-    /// 这样可以确保 thinking 块（索引 0）在文本块（索引 1）之前。
+    /// 先发送 message_start，内容块按实际收到的类型延迟创建。
+    /// 即使请求未开启 thinking，上游也可能先返回原生 reasoning。
     pub fn generate_initial_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -1591,28 +1596,6 @@ impl StreamContext {
             events.push(event);
         }
 
-        // 如果启用了 thinking，不在这里创建文本块
-        // thinking 块和文本块会在 process_content_with_thinking 中按正确顺序创建
-        if self.thinking_enabled {
-            return events;
-        }
-
-        // 创建初始文本块（仅在未启用 thinking 时）
-        let text_block_index = self.state_manager.next_block_index();
-        self.text_block_index = Some(text_block_index);
-        let text_block_events = self.state_manager.handle_content_block_start(
-            text_block_index,
-            "text",
-            json!({
-                "type": "content_block_start",
-                "index": text_block_index,
-                "content_block": {
-                    "type": "text",
-                    "text": ""
-                }
-            }),
-        );
-        events.extend(text_block_events);
 
         events
     }
@@ -1624,6 +1607,12 @@ impl StreamContext {
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
             Event::Metadata(metadata) => {
+                if let Some(reason) = metadata.stop_reason_override() {
+                    self.state_manager.set_stop_reason(reason);
+                }
+                if let Some(reason) = &metadata.stop_reason {
+                    self.upstream_stop_reason = Some(reason.clone());
+                }
                 if let Some(usage) = metadata.token_usage {
                     let usage = usage.sanitized();
                     tracing::debug!(
@@ -1695,6 +1684,7 @@ impl StreamContext {
 
     /// 处理助手响应事件
     fn process_assistant_response(&mut self, content: &str) -> Vec<SseEvent> {
+        self.upstream_text_bytes += content.len() as u64;
         // 先过滤字面 <tool_use> XML 泄漏（跨 chunk）。过滤后为空可能是过滤器在缓冲
         // 半个标签，直接返回；后续 token 估算与文本处理都用过滤后内容
         // （被剥离的 XML 因此不计入 output_tokens）。
@@ -2145,6 +2135,7 @@ impl StreamContext {
                 }
             }),
         ) {
+            self.emitted_text_bytes += text.len() as u64;
             events.push(delta_event);
         }
 
@@ -2227,16 +2218,7 @@ impl StreamContext {
         &mut self,
         reasoning: &crate::kiro::model::events::ReasoningContentEvent,
     ) -> Vec<SseEvent> {
-        if !self.thinking_enabled {
-            if let Some(text) = reasoning.text.as_deref()
-                && !text.is_empty()
-            {
-                self.output_tokens += estimate_tokens(text);
-                return self.create_text_delta_events(text);
-            }
-            return Vec::new();
-        }
-
+        // 请求开关只控制是否向上游请求思考，不改变已返回的原生事件类型。
         let mut events = Vec::new();
 
         if let Some(signature) = reasoning.signature.as_deref()
@@ -2607,6 +2589,18 @@ impl StreamContext {
         // 精确 metadata 真值优先；缺失时才使用 contextUsage/估算回退。
         let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
         let final_output_tokens = self.resolved_output_tokens();
+
+        tracing::info!(
+            message_id = %self.message_id,
+            upstream_stop_reason = ?self.upstream_stop_reason,
+            downstream_stop_reason = %self.state_manager.get_stop_reason(),
+            upstream_text_bytes = self.upstream_text_bytes,
+            emitted_text_bytes = self.emitted_text_bytes,
+            repeat_guard_tripped = self.repeat_guard_tripped,
+            provider_usage_present = self.provider_token_usage.is_some(),
+            output_tokens = final_output_tokens,
+            "Stream completed diagnostics"
+        );
 
         // 生成最终事件（message_delta + message_stop）
         events.extend(self.state_manager.generate_final_events(
@@ -3217,6 +3211,10 @@ mod tests {
         );
 
         let initial_events = ctx.generate_initial_events();
+        assert_eq!(initial_events.len(), 1);
+        assert_eq!(initial_events[0].event, "message_start");
+        assert!(ctx.text_block_index.is_none());
+        let initial_events = ctx.process_assistant_response("before tool");
         assert!(
             initial_events
                 .iter()
@@ -5194,7 +5192,7 @@ mod tests {
     }
 
     #[test]
-    fn test_native_reasoning_text_downgrades_to_text_when_thinking_disabled() {
+    fn test_native_reasoning_keeps_type_when_thinking_disabled() {
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -5206,24 +5204,27 @@ mod tests {
 
         all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
             crate::kiro::model::events::ReasoningContentEvent {
-                text: Some("visible reasoning fallback".to_string()),
-                signature: Some("ignored-signature".to_string()),
-                redacted_content: Some("ignored-redacted".to_string()),
+                text: Some("native reasoning".to_string()),
+                signature: Some("real-signature".to_string()),
+                redacted_content: Some("encrypted-thinking".to_string()),
             },
         )));
+        all_events.extend(ctx.process_assistant_response("final answer"));
         all_events.extend(ctx.generate_final_events());
 
-        assert_eq!(
-            collect_text_content(&all_events),
-            "visible reasoning fallback"
-        );
-        assert_eq!(collect_thinking_content(&all_events), "");
-        assert!(!all_events.iter().any(|e| {
-            e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
+        assert_eq!(collect_text_content(&all_events), "final answer");
+        assert_eq!(collect_thinking_content(&all_events), "native reasoning");
+        let starts: Vec<_> = all_events.iter()
+            .filter(|e| e.event == "content_block_start")
+            .map(|e| e.data["content_block"]["type"].as_str().unwrap()).collect();
+        assert_eq!(starts, vec!["thinking", "redacted_thinking", "text"]);
+        assert!(all_events.iter().any(|e| {
+            e.data["delta"]["type"] == "signature_delta"
+                && e.data["delta"]["signature"] == "real-signature"
         }));
-        assert!(!all_events.iter().any(|e| {
-            e.event == "content_block_start"
-                && e.data["content_block"]["type"] == "redacted_thinking"
+        assert!(all_events.iter().any(|e| {
+            e.data["content_block"]["type"] == "redacted_thinking"
+                && e.data["content_block"]["data"] == "encrypted-thinking"
         }));
     }
 
@@ -5450,6 +5451,7 @@ mod tests {
         };
 
         let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
+            stop_reason: None,
             token_usage: Some(TokenUsage {
                 uncached_input_tokens: 3,
                 output_tokens: 11,
@@ -5457,11 +5459,12 @@ mod tests {
                 cache_write_input_tokens: 4,
             }),
         }));
-        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent { token_usage: None }));
+        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent { token_usage: None, stop_reason: None }));
         assert_eq!(ctx.resolved_usage(), (3, 4, 7));
         assert_eq!(ctx.resolved_output_tokens(), 11);
 
         let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
+            stop_reason: None,
             token_usage: Some(TokenUsage {
                 uncached_input_tokens: -1,
                 output_tokens: 22,
@@ -5557,6 +5560,7 @@ mod tests {
         );
         let mut events = ctx.generate_initial_events();
         events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
+            stop_reason: None,
             token_usage: Some(usage),
         })));
         events.extend(ctx.generate_final_events());

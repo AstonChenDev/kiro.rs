@@ -619,7 +619,9 @@ Kiro 上游可能返回原生 `reasoningContentEvent`。`kiro-rs` 会把它转�
 - `text` → 流式 `thinking_delta`，非流式 `thinking` block。
 - `signature` → 流式 `signature_delta`，非流式 `thinking.signature`。
 - `redactedContent` → `redacted_thinking` block。
-- 如果当前请求没有启用 thinking，明文 reasoning 会降级为普通 text；签名和 redacted 内容不会输出。
+- 原生 reasoning 始终保留思考类型，即使请求未启用 thinking，也不会混入普通正文；签名及 redacted 内容同样保留。请求中的 thinking / effort 仍按原规则控制上游生成，不会因为输出分块而强制开启思考。
+
+思考输出按接口分别返回：`/v1/messages`（含 `/cc/v1/messages`）使用 `thinking` / `thinking_delta`，`/v1/chat/completions` 使用 `message.reasoning_content` / `delta.reasoning_content`，`/v1/responses` 使用 `reasoning` 项及 reasoning summary 事件。流式与非流式均适用，客户端需支持对应字段。搜索循环的明文思考也使用独立思考块，不再仅放在 `kiro_thinking` 扩展字段中。无法从没有任何标记的普通正文中可靠推断哪些内容属于思考。
 
 非流式响应优先使用原生 reasoning 事件；只有没有原生 reasoning 时，才回退到旧的 `<thinking>...</thinking>` 文本提取路径。
 
@@ -885,3 +887,19 @@ git diff --check
 - [Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager)
 
 感谢所有 issue、PR、测试和部署反馈的贡献者。
+
+
+## 本地二次开发范围（2026-10-12）
+
+本地以生产 `codex/aston-dev` 的 `1ef319fa4f62fb00d222779d35826cf374753cc2` 为基线。原项目功能及原有问题保持该版本行为；后续仅维护以下二次开发功能及它们所必需的接入代码。
+
+- 凭据管理支持 FREE、PRO、PRO+、MAX、POWER、STUDENT 六类并发／RPM 策略。类型设置是每个账号的默认值，不是全类型共享的总额度；新账号继承对应类型策略，单账号设置优先，清空单项恢复继承，0 表示不限。
+- 类型策略和单账号设置均在凭据管理页面；类型策略面板默认折叠，MAX／STUDENT 使用统一样式。显示账号实时并发及最近 60 秒请求数。
+- 每次进入凭据管理页面自动刷新额度；确认额度已耗尽时自动禁用，可手动关闭该功能。读取失败或额度未知不视为耗尽。
+- 支持删除全部选中的凭据（含跨分页选择），显示进度和失败原因，失败项保留选中。
+- 兼容平铺／嵌套凭据导入，导入导出保留单账号流量策略。
+- 上游总请求超时默认 1200 秒，可通过 `upstreamRequestTimeoutSecs` 调整；连接和读取超时仍由原有独立设置控制，因此 1200 秒不保证所有上游响应都会持续到该时间。
+- Claude Opus 4.6 的输出预算透传到上游，超过 64000 的值（包括 128000）按 64000 处理；其他模型保持原有支持范围。保留输出结束原因识别。
+- 明确的账号凭据认证失败返回 403 和受控原因文案；普通参数错误仍为 400，本站访问 Key 校验沿用原行为。已经开始输出的 SSE 流不能再改变 HTTP 状态。
+
+本机外部连接测试配置独立保留。不得因为本地修改而自动推送、部署或修改生产账号数据；发布需用户另行要求。

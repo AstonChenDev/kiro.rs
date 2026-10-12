@@ -1,3 +1,4 @@
+import type { CredentialTraffic } from '@/api/traffic'
 import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
@@ -41,7 +42,7 @@ import type {
 } from '@/types/api'
 
 // 创建 axios 实例
-const api = axios.create({
+export const api = axios.create({
   baseURL: '/api/admin',
   timeout: 15000,
   headers: {
@@ -85,6 +86,7 @@ export async function setCredentialMetadataSchema(
 
 /** KAM 导出账号（KAM 1.8.3+ 平铺格式） */
 export interface KamExportAccount {
+  traffic?: Partial<CredentialTraffic>
   email?: string
   nickname?: string
   idp?: string

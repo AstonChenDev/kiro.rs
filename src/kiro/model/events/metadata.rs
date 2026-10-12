@@ -72,9 +72,24 @@ impl TokenUsage {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetadataEvent {
+    /// Preserve the upstream termination reason for stream diagnostics.
+    #[serde(default)]
+    pub stop_reason: Option<String>,
     /// 有些 metadataEvent 只携带 stopReason，因此 tokenUsage 必须保持可选。
     #[serde(default)]
     pub token_usage: Option<TokenUsage>,
+}
+
+impl MetadataEvent {
+    /// Abnormal termination must survive protocol translation. Normal END_TURN
+    /// metadata must not erase a previous limit or inferred tool_use reason.
+    pub fn stop_reason_override(&self) -> Option<&'static str> {
+        match self.stop_reason.as_deref()?.to_ascii_uppercase().as_str() {
+            "MAX_TOKENS" => Some("max_tokens"),
+            "MODEL_CONTEXT_WINDOW_EXCEEDED" => Some("model_context_window_exceeded"),
+            _ => None,
+        }
+    }
 }
 
 impl EventPayload for MetadataEvent {
@@ -86,6 +101,21 @@ impl EventPayload for MetadataEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_limit_reasons_without_overriding_normal_completion() {
+        for (raw, expected) in [
+            ("MAX_TOKENS", Some("max_tokens")),
+            ("max_tokens", Some("max_tokens")),
+            ("MODEL_CONTEXT_WINDOW_EXCEEDED", Some("model_context_window_exceeded")),
+            ("END_TURN", None),
+            ("TOOL_USE", None),
+            ("unknown", None),
+        ] {
+            let event = MetadataEvent { stop_reason: Some(raw.into()), token_usage: None };
+            assert_eq!(event.stop_reason_override(), expected);
+        }
+    }
 
     #[test]
     fn parses_official_token_usage_shape() {
@@ -103,6 +133,7 @@ mod tests {
         .unwrap();
 
         let usage = event.token_usage.unwrap();
+        assert_eq!(event.stop_reason.as_deref(), Some("end_turn"));
         assert_eq!(usage.uncached_input_tokens, 101);
         assert_eq!(usage.output_tokens, 23);
         assert_eq!(usage.cache_read_input_tokens, 300);

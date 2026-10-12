@@ -69,6 +69,11 @@ const MAX_ADMIN_BODY_SIZE: usize = 50 * 1024 * 1024;
 pub fn create_admin_router(state: AdminState) -> Router {
     // 需要登录API密钥认证的路由
     let authenticated = Router::new()
+        .route("/config/traffic-policies", get(super::handlers::traffic_policies).put(super::handlers::set_traffic_policies).patch(super::handlers::patch_traffic_policies))
+        .route("/credentials/traffic", get(super::handlers::traffic_status))
+        .route("/credentials/{id}/traffic", put(super::handlers::set_credential_traffic))
+        .route("/credentials/{id}/traffic/restore-limits", post(super::handlers::restore_credential_traffic_limits))
+        .route("/credentials/refresh-balances", get(super::handlers::balance_refresh_status).post(super::handlers::start_balance_refresh))
         .route(
             "/credentials",
             get(get_all_credentials).post(add_credential),

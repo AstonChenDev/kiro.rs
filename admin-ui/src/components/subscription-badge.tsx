@@ -1,4 +1,4 @@
-import { Sparkles, Crown, Zap, Gem, Tag } from 'lucide-react'
+import { Sparkles, Crown, Zap, Gem, Rocket, GraduationCap, Tag } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 interface SubscriptionBadgeProps {
@@ -8,7 +8,7 @@ interface SubscriptionBadgeProps {
   className?: string
 }
 
-export type Tier = 'free' | 'pro' | 'pro_plus' | 'power' | 'unknown'
+export type Tier = 'free' | 'pro' | 'pro_plus' | 'power' | 'max' | 'student' | 'unknown'
 
 interface TierStyle {
   /** 容器背景与文字颜色 */
@@ -23,6 +23,8 @@ interface TierStyle {
 export function detectTier(title?: string | null): Tier {
   if (!title) return 'unknown'
   const upper = title.toUpperCase()
+  if (upper.includes('STUDENT')) return 'student'
+  if (upper.includes('MAX')) return 'max'
   if (upper.includes('POWER')) return 'power'
   if (upper.includes('PRO+') || upper.includes('PRO PLUS')) return 'pro_plus'
   if (upper.includes('PRO')) return 'pro'
@@ -33,6 +35,20 @@ export function detectTier(title?: string | null): Tier {
 function getTierStyle(tier: Tier, original?: string | null): TierStyle {
   const fallback = original?.replace(/^KIRO\s+/i, '').trim() || '未知'
   switch (tier) {
+    case 'max':
+      return {
+        Icon: Rocket,
+        label: 'MAX',
+        container:
+          'bg-gradient-to-br from-indigo-500 to-indigo-700 text-white shadow-[0_2px_8px_-2px_rgba(99,102,241,0.5)] border-transparent',
+      }
+    case 'student':
+      return {
+        Icon: GraduationCap,
+        label: 'STUDENT',
+        container:
+          'bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-[0_2px_8px_-2px_rgba(16,185,129,0.5)] border-transparent',
+      }
     case 'power':
       // 钻紫渐变 — 顶级版，最强视觉
       return {

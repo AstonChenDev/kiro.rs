@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react'
+import { restoreCredentialTrafficLimits } from '@/api/traffic'
+import { useState, useEffect, useRef } from 'react'
 import { toast } from 'sonner'
 import { useQueryClient } from '@tanstack/react-query'
 import {
@@ -64,6 +65,7 @@ export function BatchEditCredentialDialog({
 }: BatchEditCredentialDialogProps) {
   const queryClient = useQueryClient()
 
+  const [restoreTraffic, setRestoreTraffic] = useState(false)
   const [editGroups, setEditGroups] = useState(false)
   const [mode, setMode] = useState<GroupMode>('replace')
   const [groups, setGroups] = useState<string[]>([])
@@ -78,10 +80,12 @@ export function BatchEditCredentialDialog({
   const [salePrice, setSalePrice] = useState('')
 
   const [running, setRunning] = useState(false)
+  const applyLock = useRef(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
 
   useEffect(() => {
-    if (open) {
+    if (open && !applyLock.current) {
+      setRestoreTraffic(false)
       setEditGroups(false)
       setMode('replace')
       setGroups([])
@@ -108,7 +112,8 @@ export function BatchEditCredentialDialog({
   }
 
   const handleApply = async () => {
-    if (!editGroups && !editSource && !editType && !editSaleStatus && !editSalePrice) {
+    if (applyLock.current) return
+    if (!restoreTraffic && !editGroups && !editSource && !editType && !editSaleStatus && !editSalePrice) {
       toast.error('请至少开启一项要修改的字段')
       return
     }
@@ -121,45 +126,56 @@ export function BatchEditCredentialDialog({
       toast.error('销售价格必须是大于或等于 0 的数字')
       return
     }
+    applyLock.current = true
     setRunning(true)
-    setProgress({ current: 0, total: credentials.length })
-    let ok = 0
-    let fail = 0
-    for (let i = 0; i < credentials.length; i++) {
-      const c = credentials[i]
-      const req: UpdateCredentialRequest = {}
-      if (editGroups) req.groups = computeGroups(c.groups ?? [])
-      if (editSource) req.sourceChannel = sourceChannel.trim()
-      if (editType || editSaleStatus || editSalePrice) {
-        const metadata: CredentialMetadata = {
-          ...metadataValues(c.metadata),
-          ...(editType ? { type: credentialType } : {}),
-          ...(editSaleStatus ? { saleStatus } : {}),
+    try {
+      setProgress({ current: 0, total: credentials.length })
+      let ok = 0
+      let fail = 0
+      for (let i = 0; i < credentials.length; i++) {
+        const c = credentials[i]
+        const req: UpdateCredentialRequest = {}
+        if (editGroups) req.groups = computeGroups(c.groups ?? [])
+        if (editSource) req.sourceChannel = sourceChannel.trim()
+        if (editType || editSaleStatus || editSalePrice) {
+          const metadata: CredentialMetadata = {
+            ...metadataValues(c.metadata),
+            ...(editType ? { type: credentialType } : {}),
+            ...(editSaleStatus ? { saleStatus } : {}),
+          }
+          if (editSalePrice) {
+            if (parsedSalePrice === undefined) delete metadata.salePrice
+            else metadata.salePrice = parsedSalePrice
+          }
+          req.metadata = metadata
         }
-        if (editSalePrice) {
-          if (parsedSalePrice === undefined) delete metadata.salePrice
-          else metadata.salePrice = parsedSalePrice
+        try {
+          if (Object.keys(req).length) await updateCredential(c.id, req)
+          if (restoreTraffic) {
+            await restoreCredentialTrafficLimits(c.id)
+          }
+          ok++
+        } catch {
+          fail++
         }
-        req.metadata = metadata
+        setProgress({ current: i + 1, total: credentials.length })
       }
-      try {
-        await updateCredential(c.id, req)
-        ok++
-      } catch {
-        fail++
-      }
-      setProgress({ current: i + 1, total: credentials.length })
+      await queryClient.invalidateQueries({ queryKey: ['credential-traffic'] })
+      await queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      if (fail === 0) toast.success(`已更新 ${ok} 个账号`)
+      else toast.warning(`成功 ${ok} 个，失败 ${fail} 个`)
+      onOpenChange(false)
+      onDone()
+    } catch {
+      toast.error('批量操作未完成，请刷新后检查账号状态')
+    } finally {
+      applyLock.current = false
+      setRunning(false)
     }
-    await queryClient.invalidateQueries({ queryKey: ['credentials'] })
-    setRunning(false)
-    if (fail === 0) toast.success(`已更新 ${ok} 个账号`)
-    else toast.warning(`成功 ${ok} 个，失败 ${fail} 个`)
-    onOpenChange(false)
-    onDone()
   }
 
   return (
-    <Dialog open={open} onOpenChange={(o) => !running && onOpenChange(o)}>
+    <Dialog open={open} onOpenChange={(o) => !applyLock.current && onOpenChange(o)}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>批量编辑（{credentials.length} 个账号）</DialogTitle>
@@ -169,6 +185,11 @@ export function BatchEditCredentialDialog({
         </DialogHeader>
 
         <div className="space-y-5 py-2">
+          <div className="space-y-3 rounded-xl border border-border/60 p-3">
+            <label className="flex items-center justify-between"><span className="text-sm font-medium">恢复并发与 RPM 类型继承</span>
+              <Switch checked={restoreTraffic} onCheckedChange={setRestoreTraffic} disabled={running} /></label>
+            <p className="text-xs text-muted-foreground">清除所选账号的两项单独上限，继续保留账号类型选择。</p>
+          </div>
           {/* 分组区 */}
           <div className="space-y-3 rounded-xl border border-border/60 p-3">
             <label className="flex items-center justify-between">

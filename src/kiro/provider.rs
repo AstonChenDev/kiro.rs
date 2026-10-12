@@ -5,6 +5,8 @@
 //! 支持多凭据故障转移和重试
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
+use crate::kiro::error::UpstreamCredentialError;
+use super::traffic::LimitedResponse;
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -95,13 +97,13 @@ impl ClientCache {
 
 /// API 调用结果，附带本次实际命中的上游凭据 ID（用于用量统计）
 pub struct KiroCallResult {
-    pub response: reqwest::Response,
+    pub response: LimitedResponse,
     pub credential_id: u64,
 }
 
 /// A successful MCP HTTP response whose trace attempt is finalized after body validation.
 struct McpCallResult {
-    response: reqwest::Response,
+    response: LimitedResponse,
     credential_id: u64,
     endpoint: &'static str,
     attempt: usize,
@@ -166,7 +168,7 @@ impl KiroProvider {
         let config = token_manager.config();
         let initial_client = build_client_with_timeouts(
             proxy.as_ref(),
-            720,
+            config.upstream_request_timeout_secs.max(1),
             tls_backend,
             config.upstream_connect_timeout_secs,
             config.upstream_read_timeout_secs,
@@ -196,7 +198,7 @@ impl KiroProvider {
         let config = self.token_manager.config();
         let client = build_client_with_timeouts(
             effective.as_ref(),
-            720,
+            config.upstream_request_timeout_secs.max(1),
             self.tls_backend,
             config.upstream_connect_timeout_secs,
             config.upstream_read_timeout_secs,
@@ -304,7 +306,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         group: Option<&str>,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<LimitedResponse> {
         let result = self.call_mcp_with_retry(request_body, None, group).await?;
         self.token_manager
             .report_success_for_request(result.credential_id, None);
@@ -500,9 +502,14 @@ impl KiroProvider {
                 .header("content-type", endpoint.content_type());
             let request = endpoint.decorate_mcp(base, &rctx);
 
+            let Some(permit) = self.token_manager.try_acquire_permit(ctx.id) else {
+                last_error = Some(UpstreamRateLimitError::new(Some("1".to_string())).into());
+                continue;
+            };
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
+                    drop(permit);
                     tracing::warn!(
                         "MCP 请求发送失败（尝试 {}/{}）: {}",
                         attempt + 1,
@@ -545,7 +552,7 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 return Ok(McpCallResult {
-                    response,
+                    response: LimitedResponse::new(response, permit),
                     credential_id: ctx.id,
                     endpoint: endpoint_name,
                     attempt,
@@ -555,6 +562,7 @@ impl KiroProvider {
 
             // 失败响应
             let body = response.text().await.unwrap_or_default();
+            drop(permit);
 
             // 402 额度用尽
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
@@ -614,9 +622,9 @@ impl KiroProvider {
                         .token_manager
                         .report_suspended_for_request(ctx.id, None, group);
                     if !has_available {
-                        anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                        return Err(UpstreamCredentialError::from_response(status.as_u16(), &body).unwrap().into());
                     }
-                    last_error = Some(anyhow::anyhow!("MCP 请求失败（账号封禁）: {} {}", status, body));
+                    last_error = Some(UpstreamCredentialError::from_response(status.as_u16(), &body).unwrap().into());
                     continue;
                 }
 
@@ -648,9 +656,9 @@ impl KiroProvider {
                     .token_manager
                     .report_failure_for_request(ctx.id, None, group);
                 if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    return Err(UpstreamCredentialError::from_response(status.as_u16(), &body).unwrap().into());
                 }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(UpstreamCredentialError::from_response(status.as_u16(), &body).unwrap().into());
                 continue;
             }
 
@@ -870,9 +878,14 @@ impl KiroProvider {
                     tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
                 }
             }
+            let Some(permit) = self.token_manager.try_acquire_permit(ctx.id) else {
+                last_error = Some(UpstreamRateLimitError::new(Some("1".to_string())).into());
+                continue;
+            };
             let response = match self.client_for(&ctx.credentials)?.execute(request).await {
                 Ok(resp) => resp,
                 Err(e) => {
+                    drop(permit);
                     tracing::warn!(
                         "API 请求发送失败（尝试 {}/{}）: {}",
                         attempt + 1,
@@ -924,14 +937,16 @@ impl KiroProvider {
                     self.token_manager.bind_session(session, ctx.id);
                 }
                 return Ok(KiroCallResult {
-                    response,
+                    response: LimitedResponse::new(response, permit),
                     credential_id: ctx.id,
                 });
             }
 
             let retry_after = UpstreamRateLimitError::from_headers(response.headers());
             // 失败响应：读取 body 用于日志/错误信息
-            let body = match response.text().await {
+            let body_result = response.text().await;
+            drop(permit);
+            let body = match body_result {
                 Ok(body) => body,
                 Err(error) => {
                     Self::emit_attempt(
@@ -1067,19 +1082,9 @@ impl KiroProvider {
                         group,
                     );
                     if !has_available {
-                        anyhow::bail!(
-                            "{} API 请求失败（所有凭据已用尽）: {} {}",
-                            api_type,
-                            status,
-                            body
-                        );
+                        return Err(UpstreamCredentialError::from_response(status.as_u16(), &body).unwrap().into());
                     }
-                    last_error = Some(anyhow::anyhow!(
-                        "{} API 请求失败（账号封禁）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    ));
+                    last_error = Some(UpstreamCredentialError::from_response(status.as_u16(), &body).unwrap().into());
                     continue;
                 }
 
@@ -1112,20 +1117,10 @@ impl KiroProvider {
                     self.token_manager
                         .report_failure_for_request(ctx.id, model.as_deref(), group);
                 if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
+                    return Err(UpstreamCredentialError::from_response(status.as_u16(), &body).unwrap().into());
                 }
 
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                last_error = Some(UpstreamCredentialError::from_response(status.as_u16(), &body).unwrap().into());
                 continue;
             }
 
@@ -1417,7 +1412,7 @@ fn is_rate_limit_error(error: &anyhow::Error) -> bool {
 fn take_rate_limit_error(last_error: &mut Option<anyhow::Error>) -> Option<anyhow::Error> {
     if last_error
         .as_ref()
-        .is_some_and(|error| error.downcast_ref::<UpstreamRateLimitError>().is_some())
+        .is_some_and(|error| error.downcast_ref::<UpstreamRateLimitError>().is_some() || crate::kiro::error::credential_error_reason(error).is_some())
     {
         last_error.take()
     } else {
@@ -1576,5 +1571,16 @@ mod rate_limit_tests {
     fn current_acquire_rate_limit_is_detected_before_outer_retry() {
         let error = anyhow::Error::new(UpstreamRateLimitError::new(Some("30".to_string())));
         assert!(is_rate_limit_error(&error));
+    }
+}
+
+#[cfg(test)]
+mod credential_mapping_tests {
+    use super::*;
+    #[test]
+    fn exhausted_retries_preserve_credential_failure_reason() {
+        let mut error = Some(anyhow::Error::from(UpstreamCredentialError::Forbidden));
+        let result = take_rate_limit_error(&mut error).unwrap();
+        assert!(crate::kiro::error::credential_error_reason(&result).unwrap().contains("权限不足"));
     }
 }

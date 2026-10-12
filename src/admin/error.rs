@@ -25,6 +25,9 @@ pub enum AdminServiceError {
     /// 内部状态错误
     InternalError(String),
 
+    /// 普通参数或操作条件不满足。
+    InvalidRequest(String),
+
     /// 凭据无效（验证失败）
     InvalidCredential(String),
 }
@@ -38,6 +41,7 @@ impl fmt::Display for AdminServiceError {
             AdminServiceError::UpstreamError(_) => write!(f, "上游服务请求失败"),
             AdminServiceError::RateLimited { .. } => write!(f, "上游请求过于频繁，请稍后重试"),
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
+            AdminServiceError::InvalidRequest(msg) => write!(f, "请求无效: {}", msg),
             AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
         }
     }
@@ -53,7 +57,8 @@ impl AdminServiceError {
             AdminServiceError::UpstreamError(_) => StatusCode::BAD_GATEWAY,
             AdminServiceError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            AdminServiceError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
+            AdminServiceError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            AdminServiceError::InvalidCredential(_) => StatusCode::FORBIDDEN,
         }
     }
 
@@ -68,8 +73,11 @@ impl AdminServiceError {
             AdminServiceError::InternalError(_) => {
                 AdminErrorResponse::internal_error(self.to_string())
             }
-            AdminServiceError::InvalidCredential(_) => {
+            AdminServiceError::InvalidRequest(_) => {
                 AdminErrorResponse::invalid_request(self.to_string())
+            }
+            AdminServiceError::InvalidCredential(_) => {
+                AdminErrorResponse::new("permission_error", self.to_string())
             }
         }
     }
@@ -124,5 +132,22 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(!body.contains(secret));
         assert!(body.contains("上游服务请求失败"));
+    }
+}
+
+#[cfg(test)]
+mod credential_status_regressions {
+    use super::*;
+    #[tokio::test]
+    async fn invalid_credentials_return_403_with_reason_and_other_statuses_stay_distinct() {
+        let response = AdminServiceError::InvalidCredential("kiroApiKey 为空".into()).into_http_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "permission_error");
+        assert_eq!(body["error"]["message"], "凭据无效: kiroApiKey 为空");
+        assert_eq!(AdminServiceError::InvalidRequest("rpm 越界".into()).status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(AdminServiceError::NotFound { id: 1 }.status_code(), StatusCode::NOT_FOUND);
+        assert_eq!(AdminServiceError::UpstreamError("network".into()).status_code(), StatusCode::BAD_GATEWAY);
     }
 }

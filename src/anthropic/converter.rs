@@ -521,7 +521,42 @@ fn model_supports_xhigh_effort(model_id: &str) -> bool {
     )
 }
 
+/// Validate before opening SSE (including the internal web-search loop).
+pub(super) fn validate_model_output_budget(model: &str, budget: i32) -> Result<(), ConversionError> {
+    if map_model(model).as_deref() == Some("claude-opus-4.6")
+        && budget < 1024
+    {
+        return Err(ConversionError::InvalidMaxTokens(format!(
+            "max_tokens for claude-opus-4.6 must be at least 1024 (received {budget}); values above 64000 are capped at 64000"
+        )));
+    }
+    Ok(())
+}
+
 fn build_additional_model_request_fields(
+    req: &MessagesRequest,
+    model_id: &str,
+) -> Result<Option<AdditionalModelRequestFields>, ConversionError> {
+    let mut fields = build_reasoning_request_fields(req, model_id);
+    // Confirmed by Opus 4.6's upstream schema and real requests. Do not infer
+    // support from reasoning capability: other models reject this field.
+    if model_id == "claude-opus-4.6" {
+        validate_model_output_budget(model_id, req.max_tokens)?;
+        let effective_max_tokens = req.max_tokens.min(64000);
+        if effective_max_tokens != req.max_tokens {
+            tracing::info!(
+                model_id,
+                requested_max_tokens = req.max_tokens,
+                effective_max_tokens,
+                "Capped output budget to upstream model limit"
+            );
+        }
+        fields.get_or_insert_with(Default::default).max_tokens = Some(effective_max_tokens);
+    }
+    Ok(fields)
+}
+
+fn build_reasoning_request_fields(
     req: &MessagesRequest,
     model_id: &str,
 ) -> Option<AdditionalModelRequestFields> {
@@ -555,11 +590,13 @@ fn build_additional_model_request_fields(
     let effort = select_native_reasoning_effort(req, model_id);
     if model_uses_gpt_reasoning_effort(model_id) {
         Some(AdditionalModelRequestFields {
+            max_tokens: None,
             output_config: None,
             reasoning: Some(KiroReasoningConfig { effort }),
         })
     } else {
         Some(AdditionalModelRequestFields {
+            max_tokens: None,
             output_config: Some(KiroOutputConfig { effort }),
             reasoning: None,
         })
@@ -597,6 +634,7 @@ const COMPACTION_HISTORY_TOOL_NAME: &str = "kiro_compaction_history_tool";
 /// 转换错误
 #[derive(Debug)]
 pub enum ConversionError {
+    InvalidMaxTokens(String),
     InvalidModel(String),
     EmptyMessages,
     InvalidMessageSequence(String),
@@ -607,6 +645,7 @@ pub enum ConversionError {
 impl std::fmt::Display for ConversionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ConversionError::InvalidMaxTokens(reason) => write!(f, "{}", reason),
             ConversionError::InvalidModel(reason) => write!(f, "无效模型 ID: {}", reason),
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
             ConversionError::InvalidMessageSequence(reason) => {
@@ -894,13 +933,8 @@ pub(crate) fn convert_request_with_purpose(
         );
     }
 
-    // 14. Extract effort into AdditionalModelRequestFields only for models that accept it.
-    //
-    // The system-prompt thinking prefix remains available for every thinking mode. The real
-    // wire field is narrower: newer/non-adaptive models reject it with
-    // `additionalModelRequestFields is not supported for this model`, so keep the field opt-in
-    // by upstream model capability rather than by the mere presence of client output_config.
-    let additional_model_request_fields = build_additional_model_request_fields(req, &model_id);
+    // Budget and reasoning controls have independent upstream capabilities.
+    let additional_model_request_fields = build_additional_model_request_fields(req, &model_id)?;
 
     Ok(ConversionResult {
         conversation_state,
@@ -2362,6 +2396,27 @@ mod tests {
     }
 
     #[test]
+    fn opus_output_budget_is_forwarded_independently_of_thinking() {
+        for model in ["claude-opus-4-6", "claude-opus-4.6", "claude-opus-4-6-thinking"] {
+            for mode in ["disabled", "enabled", "adaptive"] {
+                for budget in [1024, 32000, 64000, 64001, 128000, i32::MAX] {
+                    let mut req = minimal_thinking_request(model, mode);
+                    req.max_tokens = budget;
+                    let result = convert_request(&req).unwrap();
+                    let fields = result.additional_model_request_fields.unwrap();
+                    assert_eq!(fields.max_tokens, Some(budget.min(64000)));
+                    assert_eq!(fields.output_config.is_some(), mode == "adaptive");
+                }
+            }
+        }
+        for budget in [-1, 0, 1023] {
+            let mut req = minimal_thinking_request("claude-opus-4-6", "disabled");
+            req.max_tokens = budget;
+            assert!(matches!(convert_request(&req), Err(ConversionError::InvalidMaxTokens(_))));
+        }
+    }
+
+    #[test]
     fn test_output_config_does_not_emit_unsupported_additional_fields() {
         let req = minimal_request_with_output_config("claude-sonnet-4-8-thinking");
         let result = convert_request(&req).unwrap();
@@ -2413,10 +2468,10 @@ mod tests {
         let req = minimal_request_with_output_config("claude-opus-4-6");
         let result = convert_request(&req).unwrap();
 
-        assert!(
-            result.additional_model_request_fields.is_none(),
-            "opus 4.6 only uses additionalModelRequestFields for adaptive thinking"
-        );
+        let fields = result.additional_model_request_fields.unwrap();
+        assert_eq!(fields.max_tokens, Some(1024));
+        assert!(fields.output_config.is_none());
+        assert!(fields.reasoning.is_none());
     }
 
     #[test]
@@ -2436,10 +2491,10 @@ mod tests {
         req.thinking = minimal_thinking_request("claude-opus-4-6-thinking", "enabled").thinking;
         let result = convert_request(&req).unwrap();
 
-        assert!(
-            result.additional_model_request_fields.is_none(),
-            "opus 4.6 output_config is only accepted on adaptive thinking requests"
-        );
+        let fields = result.additional_model_request_fields.unwrap();
+        assert_eq!(fields.max_tokens, Some(1024));
+        assert!(fields.output_config.is_none());
+        assert!(fields.reasoning.is_none());
     }
 
     #[test]

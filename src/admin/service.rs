@@ -148,6 +148,8 @@ const UPDATE_CHECK_TTL_SECS: i64 = 1800;
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedBalance {
+    #[serde(default)]
+    traffic_identity: Option<String>,
     /// 缓存时间（Unix 秒）
     cached_at: f64,
     /// 缓存的余额数据
@@ -187,17 +189,17 @@ fn available_models_response(
 fn validate_model_id(model_id: &str) -> Result<&str, AdminServiceError> {
     let model_id = model_id.trim();
     if model_id.is_empty() {
-        return Err(AdminServiceError::InvalidCredential(
+        return Err(AdminServiceError::InvalidRequest(
             "模型 ID 不能为空".to_string(),
         ));
     }
     if model_id.len() > 256 || model_id.chars().any(char::is_control) {
-        return Err(AdminServiceError::InvalidCredential(
+        return Err(AdminServiceError::InvalidRequest(
             "模型 ID 格式无效".to_string(),
         ));
     }
     if model_id.eq_ignore_ascii_case("auto") {
-        return Err(AdminServiceError::InvalidCredential(
+        return Err(AdminServiceError::InvalidRequest(
             "自动路由模型不支持直接测试，请选择具体模型".to_string(),
         ));
     }
@@ -296,13 +298,31 @@ impl RuntimeUpdateConfig {
     }
 }
 
-/// Admin 服务
-///
-/// 封装所有 Admin API 的业务逻辑
+#[cfg(test)]
+type TestBalanceFetcher = Arc<dyn Fn(u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BalanceResponse, AdminServiceError>> + Send>> + Send + Sync>;
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceRefreshJob {
+    pub running: bool,
+    pub total: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub errors: BTreeMap<u64, String>,
+    pub finished_at: Option<String>,
+}
+
+/// Admin API 业务逻辑与运行状态。
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
     kiro_provider: Option<Arc<KiroProvider>>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
+    balance_locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
+    balance_slots: tokio::sync::Semaphore,
+    balance_refresh_job: Mutex<BalanceRefreshJob>,
+    #[cfg(test)]
+    test_balance_fetcher: Mutex<Option<TestBalanceFetcher>>,
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
@@ -375,7 +395,7 @@ fn idc_provider_for(start_url: &str) -> &'static str {
 fn parse_auto_apply_time(value: &str) -> Result<(u32, u32), AdminServiceError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err(AdminServiceError::InvalidCredential(
+        return Err(AdminServiceError::InvalidRequest(
             "自动更新时间不能为空".to_string(),
         ));
     }
@@ -383,19 +403,19 @@ fn parse_auto_apply_time(value: &str) -> Result<(u32, u32), AdminServiceError> {
     let hour_str = parts.next().unwrap_or("");
     let minute_str = parts.next().unwrap_or("");
     let hour: u32 = hour_str.parse().map_err(|_| {
-        AdminServiceError::InvalidCredential(format!(
+        AdminServiceError::InvalidRequest(format!(
             "自动更新时间格式无效：{}（应为 HH:MM）",
             value
         ))
     })?;
     let minute: u32 = minute_str.parse().map_err(|_| {
-        AdminServiceError::InvalidCredential(format!(
+        AdminServiceError::InvalidRequest(format!(
             "自动更新时间格式无效：{}（应为 HH:MM）",
             value
         ))
     })?;
     if hour > 23 || minute > 59 {
-        return Err(AdminServiceError::InvalidCredential(format!(
+        return Err(AdminServiceError::InvalidRequest(format!(
             "自动更新时间超出范围：{}（HH 0-23，MM 0-59）",
             value
         )));
@@ -592,6 +612,7 @@ fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount
     };
 
     Some(ExportedAccount {
+        traffic: cred.traffic,
         id: uuid::Uuid::new_v4().to_string(),
         email: non_empty(cred.email).unwrap_or_default(),
         nickname: None,
@@ -666,6 +687,11 @@ impl AdminService {
             token_manager,
             kiro_provider: None,
             balance_cache: Mutex::new(balance_cache),
+            balance_locks: Mutex::new(HashMap::new()),
+            balance_slots: tokio::sync::Semaphore::new(3),
+            balance_refresh_job: Mutex::new(BalanceRefreshJob::default()),
+            #[cfg(test)]
+            test_balance_fetcher: Mutex::new(None),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
             proxy_pool: ProxyPoolManager::new(proxy_pool_path, token_manager_tls_backend),
@@ -750,7 +776,7 @@ impl AdminService {
         req: SetCacheMeteringConfigRequest,
     ) -> Result<CacheMeteringConfigResponse, AdminServiceError> {
         let Some(enabled) = req.enabled else {
-            return Err(AdminServiceError::InvalidCredential(
+            return Err(AdminServiceError::InvalidRequest(
                 "请提供 enabled 字段".to_string(),
             ));
         };
@@ -784,15 +810,13 @@ impl AdminService {
             let cache = self.balance_cache.lock();
             cache.clone()
         };
-        let now_ts = Utc::now().timestamp() as f64;
-
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
             .map(|entry| {
                 let (balance, balance_updated_at) = balance_snapshot
                     .get(&entry.id)
-                    .filter(|c| (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64)
+                    .filter(|c| c.traffic_identity.as_deref() == self.token_manager.balance_identity(entry.id).ok().as_deref())
                     .map(|c| (Some(c.data.clone()), Some(c.cached_at)))
                     .unwrap_or((None, None));
                 let metadata = credential_metadata_details(&entry.metadata, &metadata_schema);
@@ -854,7 +878,7 @@ impl AdminService {
         req: CredentialMetadataSchemaConfig,
     ) -> Result<CredentialMetadataSchemaConfig, AdminServiceError> {
         validate_credential_metadata_schema(&req.schema)
-            .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
+            .map_err(|error| AdminServiceError::InvalidRequest(error.to_string()))?;
         let schema_for_save = req.schema.clone();
         self.token_manager
             .update_config_file(move |config| {
@@ -993,39 +1017,94 @@ impl AdminService {
 
     /// 获取凭据余额（带缓存）
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        // 先查缓存
+        self.refresh_balance(id, false).await
+    }
+
+    pub async fn refresh_balance(&self, id: u64, force: bool) -> Result<BalanceResponse, AdminServiceError> {
+        let now = Utc::now();
+        let identity = self.token_manager.balance_identity(id).map_err(|e| self.classify_error(e, id))?;
+        let requested_at = now.timestamp() as f64 + now.timestamp_subsec_nanos() as f64 / 1e9;
+        let lock = self.balance_locks.lock().entry(id).or_default().clone();
+        let _guard = lock.lock().await;
         {
             let cache = self.balance_cache.lock();
             if let Some(cached) = cache.get(&id) {
-                let now = Utc::now().timestamp() as f64;
-                if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    tracing::debug!("凭据 #{} 余额命中缓存", id);
-                    return Ok(cached.data.clone());
+                if cached.traffic_identity.as_deref() == Some(identity.as_str())
+                    && ((!force && requested_at - cached.cached_at < BALANCE_CACHE_TTL_SECS as f64)
+                    || cached.cached_at >= requested_at) {
+                    let balance = cached.data.clone();
+                    drop(cache);
+                    self.apply_balance_quota_policy(&balance, &identity)?;
+                    return Ok(balance);
                 }
             }
         }
-
-        // 缓存未命中或已过期，从上游获取
-        let balance = self.fetch_balance(id).await?;
-
-        // 更新缓存
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.insert(
-                id,
-                CachedBalance {
-                    cached_at: Utc::now().timestamp() as f64,
-                    data: balance.clone(),
-                },
-            );
-        }
+        let _slot = self.balance_slots.acquire().await.map_err(|_| AdminServiceError::InternalError("额度查询已关闭".into()))?;
+        let balance = tokio::time::timeout(std::time::Duration::from_secs(45), self.fetch_balance(id))
+            .await.map_err(|_| AdminServiceError::InternalError("额度查询超时".into()))??;
+        self.apply_balance_quota_policy(&balance, &identity)?;
+        let now = Utc::now();
+        self.balance_cache.lock().insert(id, CachedBalance {
+            traffic_identity: Some(identity.clone()),
+            cached_at: now.timestamp() as f64 + now.timestamp_subsec_nanos() as f64 / 1e9,
+            data: balance.clone(),
+        });
         self.save_balance_cache();
-
         Ok(balance)
+    }
+
+    fn apply_balance_quota_policy(&self, balance: &BalanceResponse, identity: &str) -> Result<(), AdminServiceError> {
+        let policy = self.token_manager.traffic_policies();
+        self.token_manager.apply_traffic_quota(balance.id, identity, should_disable_balance(balance, &policy))
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn balance_refresh_status(&self) -> BalanceRefreshJob { self.balance_refresh_job.lock().clone() }
+
+    pub fn start_balance_refresh(self: &Arc<Self>) -> BalanceRefreshJob {
+        let entries = self.token_manager.snapshot().entries;
+        {
+            let mut job = self.balance_refresh_job.lock();
+            if job.running { return job.clone(); }
+            *job = BalanceRefreshJob { running: true, total: entries.len(), ..Default::default() };
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            futures::stream::iter(entries).for_each_concurrent(3, |entry| {
+                let service = service.clone();
+                async move {
+                    if matches!(entry.disabled_reason.as_deref(), Some("InvalidRefreshToken" | "InvalidConfig" | "Suspended")) {
+                        let mut job = service.balance_refresh_job.lock();
+                        job.skipped += 1;
+                        job.completed += 1;
+                        job.errors.insert(entry.id, "凭据已失效或封禁，跳过查询".into());
+                        return;
+                    }
+                    let result = service.refresh_balance(entry.id, true).await;
+                    let mut job = service.balance_refresh_job.lock();
+                    job.completed += 1;
+                    if result.is_err() {
+                        job.failed += 1;
+                        job.errors.insert(entry.id, "额度刷新失败，保留上次数据".into());
+                    }
+                }
+            }).await;
+            let mut job = service.balance_refresh_job.lock();
+            job.running = false;
+            job.finished_at = Some(Utc::now().to_rfc3339());
+        });
+        self.balance_refresh_status()
     }
 
     /// 从上游获取余额（无缓存）
     async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
+        #[cfg(test)]
+        {
+            let fetcher = self.test_balance_fetcher.lock().clone();
+            if let Some(fetcher) = fetcher { return fetcher(id).await; }
+        }
         let usage = self
             .token_manager
             .get_usage_limits_for(id)
@@ -1085,7 +1164,7 @@ impl AdminService {
     ) -> Result<AvailableModelsResponse, AdminServiceError> {
         let snapshot = self.token_manager.snapshot();
         if snapshot.available == 0 {
-            return Err(AdminServiceError::InvalidCredential(
+            return Err(AdminServiceError::InvalidRequest(
                 "没有当前可用凭据，无法查询模型列表".to_string(),
             ));
         }
@@ -1243,23 +1322,13 @@ impl AdminService {
             if entry.disabled && !quota_recovery_probe {
                 continue;
             }
-            match self.fetch_balance(entry.id).await {
+            match self.refresh_balance(entry.id, true).await {
                 Ok(balance) => {
                     // 此路径只恢复此前因额度耗尽而被禁用的账号。即使超额开关
                     // 仍为开启，也不能证明超额额度尚未耗尽；只有订阅额度在新
                     // 计费周期恢复为正数时才重新加入调度。
                     let quota_recovered = quota_recovery_probe && balance.remaining > 0.0;
                     let remaining = balance.remaining;
-                    {
-                        let mut cache = self.balance_cache.lock();
-                        cache.insert(
-                            entry.id,
-                            CachedBalance {
-                                cached_at: Utc::now().timestamp() as f64,
-                                data: balance,
-                            },
-                        );
-                    }
                     if quota_recovered {
                         match self.token_manager.recover_quota_exceeded(entry.id) {
                             Ok(true) => tracing::info!(
@@ -1443,14 +1512,14 @@ impl AdminService {
         fetch_balance: bool,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
         validate_credential_metadata(&req.metadata, &self.credential_metadata_schema.lock())
-            .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
+            .map_err(|error| AdminServiceError::InvalidRequest(error.to_string()))?;
         // 校验端点名：未指定则默认合法，指定则必须已注册
         if let Some(ref name) = req.endpoint {
             if !self.known_endpoints.contains(name) {
                 let mut known: Vec<&str> =
                     self.known_endpoints.iter().map(|s| s.as_str()).collect();
                 known.sort();
-                return Err(AdminServiceError::InvalidCredential(format!(
+                return Err(AdminServiceError::InvalidRequest(format!(
                     "未知端点 \"{}\"，已注册端点: {:?}",
                     name, known
                 )));
@@ -1476,17 +1545,17 @@ impl AdminService {
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
             let Some(token_endpoint) = token_endpoint else {
-                return Err(AdminServiceError::InvalidCredential(
+                return Err(AdminServiceError::InvalidRequest(
                     "企业 SSO (external_idp) 需要 clientId 和 tokenEndpoint".to_string(),
                 ));
             };
             if !client_id_ok {
-                return Err(AdminServiceError::InvalidCredential(
+                return Err(AdminServiceError::InvalidRequest(
                     "企业 SSO (external_idp) 需要 clientId 和 tokenEndpoint".to_string(),
                 ));
             }
             validate_external_idp_endpoint(token_endpoint).map_err(|e| {
-                AdminServiceError::InvalidCredential(format!("tokenEndpoint 被拒绝: {}", e))
+                AdminServiceError::InvalidRequest(format!("tokenEndpoint 被拒绝: {}", e))
             })?;
             if let Some(issuer) = req
                 .issuer_url
@@ -1495,14 +1564,17 @@ impl AdminService {
                 .filter(|s| !s.is_empty())
             {
                 validate_external_idp_endpoint(issuer).map_err(|e| {
-                    AdminServiceError::InvalidCredential(format!("issuerUrl 被拒绝: {}", e))
+                    AdminServiceError::InvalidRequest(format!("issuerUrl 被拒绝: {}", e))
                 })?;
             }
         }
 
+        req.traffic.validate().map_err(|e| AdminServiceError::InvalidRequest(e.to_string()))?;
+
         // 构建凭据对象
         let email = req.email.clone();
         let new_cred = KiroCredentials {
+            traffic: req.traffic.clone(),
             id: None,
             access_token: req.access_token,
             refresh_token: req.refresh_token,
@@ -1652,7 +1724,7 @@ impl AdminService {
     ) -> Result<(), AdminServiceError> {
         if let Some(metadata) = req.metadata.as_ref() {
             validate_credential_metadata(metadata, &self.credential_metadata_schema.lock())
-                .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
+                .map_err(|error| AdminServiceError::InvalidRequest(error.to_string()))?;
         }
         self.token_manager
             .update_credential(
@@ -1727,7 +1799,7 @@ impl AdminService {
             .iter()
             .any(|scheme| normalized.starts_with(scheme));
             if !valid_prefix {
-                return Err(AdminServiceError::InvalidCredential(
+                return Err(AdminServiceError::InvalidRequest(
                     "代理 URL 格式无效，需以 http://、https://、socks4://、socks4a://、socks5:// 或 socks5h:// 开头"
                         .to_string(),
                 ));
@@ -1788,7 +1860,7 @@ impl AdminService {
             let id = m.id.trim();
             let backend_id = m.backend_id.trim();
             if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
-                return Err(AdminServiceError::InvalidCredential(format!(
+                return Err(AdminServiceError::InvalidRequest(format!(
                     "第 {} 条模型的 id 必须是 1-128 个非控制字符",
                     i + 1,
                 )));
@@ -1797,7 +1869,7 @@ impl AdminService {
                 || backend_id.len() > 256
                 || backend_id.chars().any(char::is_control)
             {
-                return Err(AdminServiceError::InvalidCredential(format!(
+                return Err(AdminServiceError::InvalidRequest(format!(
                     "第 {} 条模型（{}）的 backend_id 必须是 1-256 个非控制字符",
                     i + 1,
                     id,
@@ -1805,7 +1877,7 @@ impl AdminService {
             }
             if let Some(value) = m.context_window {
                 if !(1..=10_000_000).contains(&value) {
-                    return Err(AdminServiceError::InvalidCredential(format!(
+                    return Err(AdminServiceError::InvalidRequest(format!(
                         "第 {} 条模型的 contextWindow 必须在 1 到 10000000 之间",
                         i + 1
                     )));
@@ -1813,7 +1885,7 @@ impl AdminService {
             }
             if let Some(value) = m.max_tokens {
                 if !(1..=1_000_000).contains(&value) {
-                    return Err(AdminServiceError::InvalidCredential(format!(
+                    return Err(AdminServiceError::InvalidRequest(format!(
                         "第 {} 条模型的 maxTokens 必须在 1 到 1000000 之间",
                         i + 1
                     )));
@@ -1825,7 +1897,7 @@ impl AdminService {
         for model in &req.models {
             let key = model.id.trim().to_ascii_lowercase();
             if !seen_ids.insert(key) {
-                return Err(AdminServiceError::InvalidCredential(
+                return Err(AdminServiceError::InvalidRequest(
                     "自定义模型 id 不能重复（不区分大小写）".to_string(),
                 ));
             }
@@ -2051,7 +2123,7 @@ impl AdminService {
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .ok_or_else(|| {
-                AdminServiceError::InvalidCredential(
+                AdminServiceError::InvalidRequest(
                     "尚未记录可回退的版本，请先执行一次在线更新".to_string(),
                 )
             })?
@@ -2108,7 +2180,7 @@ impl AdminService {
             ));
         }
         if require_update && !info.has_update {
-            return Err(AdminServiceError::InvalidCredential(format!(
+            return Err(AdminServiceError::InvalidRequest(format!(
                 "当前已是最新版本 v{}，无需更新",
                 info.current_version
             )));
@@ -2419,7 +2491,7 @@ impl AdminService {
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
         // 验证模式值
         if req.mode != "priority" && req.mode != "balanced" {
-            return Err(AdminServiceError::InvalidCredential(
+            return Err(AdminServiceError::InvalidRequest(
                 "mode 必须是 'priority' 或 'balanced'".to_string(),
             ));
         }
@@ -2449,14 +2521,14 @@ impl AdminService {
         req: SetSessionAffinityConfigRequest,
     ) -> Result<SessionAffinityConfigResponse, AdminServiceError> {
         if req.enabled.is_none() && req.ttl_secs.is_none() {
-            return Err(AdminServiceError::InvalidCredential(
+            return Err(AdminServiceError::InvalidRequest(
                 "至少提供 enabled 或 ttlSecs 一个字段".to_string(),
             ));
         }
 
         self.token_manager
             .set_session_affinity_config(req.enabled, req.ttl_secs)
-            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+            .map_err(|e| AdminServiceError::InvalidRequest(e.to_string()))?;
 
         Ok(self.get_session_affinity_config())
     }
@@ -2475,14 +2547,14 @@ impl AdminService {
         req: SetAccountThrottleConfigRequest,
     ) -> Result<AccountThrottleConfigResponse, AdminServiceError> {
         if req.failover.is_none() && req.cooldown_secs.is_none() {
-            return Err(AdminServiceError::InvalidCredential(
+            return Err(AdminServiceError::InvalidRequest(
                 "至少提供 failover 或 cooldownSecs 一个字段".to_string(),
             ));
         }
 
         self.token_manager
             .set_account_throttle_config(req.failover, req.cooldown_secs)
-            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+            .map_err(|e| AdminServiceError::InvalidRequest(e.to_string()))?;
 
         Ok(self.get_account_throttle_config())
     }
@@ -2518,14 +2590,14 @@ impl AdminService {
         req: SetAccountRpmLimitConfigRequest,
     ) -> Result<AccountRpmLimitConfigResponse, AdminServiceError> {
         if req.enabled.is_none() && req.limit.is_none() {
-            return Err(AdminServiceError::InvalidCredential(
+            return Err(AdminServiceError::InvalidRequest(
                 "至少提供 enabled 或 limit 一个字段".to_string(),
             ));
         }
 
         self.token_manager
             .set_account_rpm_limit_config(req.enabled, req.limit)
-            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+            .map_err(|e| AdminServiceError::InvalidRequest(e.to_string()))?;
 
         Ok(self.get_account_rpm_limit_config())
     }
@@ -2543,7 +2615,7 @@ impl AdminService {
         req: SetQuotaResetRecoveryConfigRequest,
     ) -> Result<QuotaResetRecoveryConfigResponse, AdminServiceError> {
         let Some(enabled) = req.enabled else {
-            return Err(AdminServiceError::InvalidCredential(
+            return Err(AdminServiceError::InvalidRequest(
                 "必须提供 enabled 字段".to_string(),
             ));
         };
@@ -2583,7 +2655,7 @@ impl AdminService {
             && req.min_interval_secs.is_none()
             && req.max_consecutive_rounds.is_none()
         {
-            return Err(AdminServiceError::InvalidCredential(
+            return Err(AdminServiceError::InvalidRequest(
                 "至少提供 suspendedDetectionEnabled / enabled / minIntervalSecs / maxConsecutiveRounds 一个字段"
                     .to_string(),
             ));
@@ -2596,7 +2668,7 @@ impl AdminService {
                 req.min_interval_secs,
                 req.max_consecutive_rounds,
             )
-            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+            .map_err(|e| AdminServiceError::InvalidRequest(e.to_string()))?;
 
         Ok(self.get_self_heal_config())
     }
@@ -2633,7 +2705,7 @@ impl AdminService {
             && req.trace_retention_days.is_none()
             && req.usage_log_retention_days.is_none()
         {
-            return Err(AdminServiceError::InvalidCredential(
+            return Err(AdminServiceError::InvalidRequest(
                 "至少提供 traceEnabled / traceRetentionDays / usageLogRetentionDays 一个字段"
                     .to_string(),
             ));
@@ -2645,7 +2717,7 @@ impl AdminService {
         ] {
             if let Some(d) = v {
                 if !(1..=365).contains(&d) {
-                    return Err(AdminServiceError::InvalidCredential(format!(
+                    return Err(AdminServiceError::InvalidRequest(format!(
                         "{} 必须在 1..=365 内: {}",
                         name, d
                     )));
@@ -2713,7 +2785,7 @@ impl AdminService {
                     || msg.contains("refreshToken 为空")
                     || msg.contains("缺少 refreshToken")
                 {
-                    AdminServiceError::InvalidCredential(msg)
+                    AdminServiceError::InvalidRequest(msg)
                 } else {
                     AdminServiceError::InternalError(msg)
                 }
@@ -2934,7 +3006,7 @@ impl AdminService {
         let entry = self
             .proxy_pool
             .add(url, label)
-            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+            .map_err(|e| AdminServiceError::InvalidRequest(e.to_string()))?;
         Ok(ProxyPoolEntry {
             id: entry.id,
             url: entry.url,
@@ -3006,7 +3078,7 @@ impl AdminService {
                         return Err(AdminServiceError::NotFound { id: proxy_id });
                     }
                     GetUrlResult::Disabled => {
-                        return Err(AdminServiceError::InvalidCredential(format!(
+                        return Err(AdminServiceError::InvalidRequest(format!(
                             "代理 #{} 已被禁用，请先启用后再分配",
                             proxy_id
                         )));
@@ -3075,7 +3147,7 @@ impl AdminService {
     ) -> Result<AssignRoundRobinResponse, AdminServiceError> {
         let urls = self.proxy_pool.assignable_urls();
         if urls.is_empty() {
-            return Err(AdminServiceError::InvalidCredential(
+            return Err(AdminServiceError::InvalidRequest(
                 "没有可用代理（需已启用且健康检查未失败）".to_string(),
             ));
         }
@@ -3122,6 +3194,7 @@ impl AdminService {
 
     /// 分类简单操作错误（set_disabled, set_priority, reset_and_enable）
     fn classify_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        if let Some(reason) = crate::kiro::error::credential_error_reason(&e) { return AdminServiceError::InvalidCredential(reason); }
         if let Some(error) = classify_rate_limit(&e) {
             return error;
         }
@@ -3135,6 +3208,7 @@ impl AdminService {
 
     /// 分类余额查询错误（可能涉及上游 API 调用）
     fn classify_balance_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        if let Some(reason) = crate::kiro::error::credential_error_reason(&e) { return AdminServiceError::InvalidCredential(reason); }
         if let Some(error) = classify_rate_limit(&e) {
             return error;
         }
@@ -3151,7 +3225,7 @@ impl AdminService {
 
         // 2. API Key 凭据不支持刷新：客户端请求错误，映射为 400
         if msg.contains("API Key 凭据不支持刷新") {
-            return AdminServiceError::InvalidCredential(msg);
+            return AdminServiceError::InvalidRequest(msg);
         }
 
         // 3. 上游明确指出凭据缺少或携带了错误的 Profile ARN，属于导入凭据不完整/无效。
@@ -3195,6 +3269,7 @@ impl AdminService {
 
     /// 分类添加凭据错误
     fn classify_add_error(&self, e: anyhow::Error) -> AdminServiceError {
+        if let Some(reason) = crate::kiro::error::credential_error_reason(&e) { return AdminServiceError::InvalidCredential(reason); }
         if let Some(error) = classify_rate_limit(&e) {
             return error;
         }
@@ -3214,7 +3289,7 @@ impl AdminService {
             || msg.contains("已被限流");
 
         if is_invalid_credential {
-            AdminServiceError::InvalidCredential(msg)
+            AdminServiceError::InvalidRequest(msg)
         } else if msg.contains("error trying to connect")
             || msg.contains("connection")
             || msg.contains("timeout")
@@ -3483,7 +3558,7 @@ impl AdminService {
             AdminServiceError::NotFound { id }
         } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
         {
-            AdminServiceError::InvalidCredential(msg)
+            AdminServiceError::InvalidRequest(msg)
         } else {
             AdminServiceError::InternalError(msg)
         }
@@ -3648,7 +3723,7 @@ impl AdminService {
                 // 重新登录模式：更新已有凭据而非创建新凭据
                 if let Some(target_id) = relogin_target_id {
                     let refresh_token = token.refresh_token.ok_or_else(|| {
-                        AdminServiceError::InvalidCredential(
+                        AdminServiceError::InvalidRequest(
                             "IdC 登录未返回 refreshToken，无法更新凭据".to_string(),
                         )
                     })?;
@@ -3884,6 +3959,7 @@ mod tests {
     #[test]
     fn quota_recovery_uses_own_reset_time_before_fallback() {
         let balance = |next_reset_at| CachedBalance {
+            traffic_identity: None,
             cached_at: 1.0,
             data: BalanceResponse {
                 id: 1,
@@ -4045,7 +4121,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_refresh_token_is_classified_as_bad_request() {
+    async fn invalid_refresh_token_is_classified_as_forbidden() {
         let manager = Arc::new(
             MultiTokenManager::new(Config::default(), Vec::new(), None, None, false).unwrap(),
         );
@@ -4061,7 +4137,7 @@ mod tests {
         ));
         assert_eq!(
             classified.status_code(),
-            axum::http::StatusCode::BAD_REQUEST
+            axum::http::StatusCode::FORBIDDEN
         );
     }
 
@@ -4125,5 +4201,193 @@ mod tests {
             "Enterprise"
         );
         assert_eq!(subscription_type_from_title(None), "Free");
+    }
+}
+
+/// A missing/invalid allowance is not evidence of exhaustion. Overage choice is explicit.
+fn should_disable_balance(balance: &BalanceResponse, policy: &crate::kiro::traffic::TrafficPolicies) -> bool {
+    policy.auto_disable_quota
+        && balance.usage_limit.is_finite() && balance.usage_limit > 0.0
+        && balance.current_usage.is_finite() && balance.current_usage >= balance.usage_limit
+        && (policy.disable_at_base_quota || balance.overage_enabled == Some(false))
+}
+
+#[cfg(test)]
+mod traffic_quota_tests {
+    use super::*;
+    fn test_balance(id: u64, usage: f64) -> BalanceResponse {
+        BalanceResponse { id, subscription_title: Some("KIRO POWER".into()), current_usage: usage,
+            usage_limit: 100.0, remaining: 100.0 - usage, usage_percentage: usage,
+            next_reset_at: None, overage_enabled: Some(false), overage_capable: Some(true), overage_capability_raw: None }
+    }
+
+    #[tokio::test]
+    async fn traffic_refresh_coalesces_bypasses_cache_and_disables_only_exhausted() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let credentials = (1..=3).map(|id| KiroCredentials { id: Some(id), ..Default::default() }).collect();
+        let manager = Arc::new(MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap());
+        let service = Arc::new(AdminService::new(manager.clone(), Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorded = calls.clone();
+        *service.test_balance_fetcher.lock() = Some(Arc::new(move |id| {
+            recorded.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                if id == 3 { return Err(AdminServiceError::InternalError("fixture failure".into())); }
+                Ok(test_balance(id, if id == 1 { 100.0 } else { 10.0 }))
+            })
+        }));
+        service.balance_cache.lock().insert(1, CachedBalance { traffic_identity: None, cached_at: Utc::now().timestamp() as f64, data: test_balance(1, 0.0) });
+        service.balance_cache.lock().insert(3, CachedBalance { traffic_identity: None, cached_at: Utc::now().timestamp() as f64, data: test_balance(3, 5.0) });
+        let (a, b) = tokio::join!(service.refresh_balance(1, true), service.refresh_balance(1, true));
+        assert_eq!(a.unwrap().current_usage, 100.0);
+        assert_eq!(b.unwrap().current_usage, 100.0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.snapshot().entries[0].disabled_reason.as_deref(), Some("QuotaExceeded"));
+        // Two page visits share the running job; failed refresh retains cached data.
+        service.start_balance_refresh(); service.start_balance_refresh();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while service.balance_refresh_status().running { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let job = service.balance_refresh_status();
+        assert_eq!((job.total, job.completed, job.failed), (3, 3, 1));
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(service.balance_cache.lock().get(&3).unwrap().data.current_usage, 5.0);
+        assert!(!manager.snapshot().entries[1].disabled);
+        assert!(!manager.snapshot().entries[2].disabled);
+        manager.set_disabled(2, true).unwrap();
+        service.apply_balance_quota_policy(&test_balance(2, 100.0), &service.token_manager.balance_identity(2).unwrap()).unwrap();
+        assert_eq!(manager.snapshot().entries[1].disabled_reason.as_deref(), Some("Manual"));
+    }
+
+    #[test]
+    fn quota_policy_requires_valid_evidence_and_respects_overage() {
+        let mut policy = crate::kiro::traffic::TrafficPolicies::default();
+        let mut balance = BalanceResponse {
+            id: 1, subscription_title: Some("KIRO STUDENT".into()), current_usage: 100.0,
+            usage_limit: 100.0, remaining: 0.0, usage_percentage: 100.0, next_reset_at: None,
+            overage_enabled: Some(false), overage_capable: Some(false), overage_capability_raw: None,
+        };
+        assert!(should_disable_balance(&balance, &policy));
+        balance.usage_limit = 0.0;
+        assert!(!should_disable_balance(&balance, &policy));
+        balance.usage_limit = 100.0; balance.current_usage = f64::NAN;
+        assert!(!should_disable_balance(&balance, &policy));
+        balance.current_usage = 100.0; policy.auto_disable_quota = false;
+        assert!(!should_disable_balance(&balance, &policy));
+        policy.auto_disable_quota = true; policy.disable_at_base_quota = false;
+        balance.overage_enabled = Some(true);
+        assert!(!should_disable_balance(&balance, &policy));
+        balance.overage_enabled = None;
+        assert!(!should_disable_balance(&balance, &policy));
+        balance.overage_enabled = Some(false);
+        assert!(should_disable_balance(&balance, &policy));
+    }
+}
+
+#[cfg(test)]
+mod feature_audit_export_preserves_credential_limits { use super::*;
+#[test]
+    fn audit_export_preserves_credential_limits() {
+        let mut cred = KiroCredentials { refresh_token:Some("audit-fixture-refresh".into()), ..Default::default() };
+        cred.traffic.concurrency=Some(150); cred.traffic.rpm=Some(100);
+        cred.traffic.tier=Some(crate::kiro::traffic::AccountTier::Power);
+        let exported = serde_json::to_value(credential_to_export_account(cred).unwrap()).unwrap();
+        assert_eq!(exported["traffic"], serde_json::json!({"tier":"power", "concurrency":150, "rpm":100}));
+        let imported: AddCredentialRequest = serde_json::from_value(serde_json::json!({"refreshToken":"fixture", "traffic":exported["traffic"]})).unwrap();
+        assert_eq!(imported.traffic.concurrency, Some(150));
+        assert_eq!(imported.traffic.rpm, Some(100));
+    }
+}
+
+#[cfg(test)]
+mod feature_audit_round2_cached_quota_applies_new_policy { use super::*;
+#[tokio::test]
+    async fn audit_round2_cached_quota_applies_new_policy() {
+        let mut config = Config::default(); config.traffic_policies.auto_disable_quota = false;
+        let manager = Arc::new(MultiTokenManager::new(config, vec![KiroCredentials {id:Some(1), ..Default::default()}], None, None, false).unwrap());
+        let service = AdminService::new(manager.clone(), Vec::new());
+        *service.test_balance_fetcher.lock() = Some(Arc::new(|id| Box::pin(async move { Ok(BalanceResponse {
+            id, subscription_title: Some("KIRO POWER".into()), current_usage:100.0,
+            usage_limit:100.0, remaining:0.0, usage_percentage:100.0, next_reset_at:None,
+            overage_enabled:Some(false), overage_capable:Some(true), overage_capability_raw:None,
+        }) })));
+        service.get_balance(1).await.unwrap();
+        let mut policy = manager.traffic_policies(); policy.auto_disable_quota = true;
+        manager.set_traffic_policies(policy).unwrap();
+        let balance=service.get_balance(1).await.unwrap();
+        let disabled=manager.snapshot().entries[0].disabled;
+        eprintln!("EVIDENCE valid cached usage={}/{}, auto_disable=true, disabled={disabled}", balance.current_usage,balance.usage_limit);
+        assert!(disabled, "an exhausted valid cached balance should not bypass the enabled quota policy");
+    }
+}
+
+#[cfg(test)]
+mod traffic_balance_rotation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn exhausted(id: u64) -> BalanceResponse {
+        BalanceResponse { id, subscription_title: Some("KIRO POWER".into()), current_usage: 100.0,
+            usage_limit: 100.0, remaining: 0.0, usage_percentage: 100.0, next_reset_at: None,
+            overage_enabled: Some(false), overage_capable: Some(true), overage_capability_raw: None }
+    }
+
+    async fn check_normal_rotation(auto_disable: bool) {
+        let mut config = Config::default();
+        config.traffic_policies.auto_disable_quota = auto_disable;
+        let manager = Arc::new(MultiTokenManager::new(config, vec![KiroCredentials {
+            id: Some(1), refresh_token: Some("original-fixture-".repeat(12)), ..Default::default()
+        }], None, None, false).unwrap());
+        let service = AdminService::new(manager.clone(), Vec::new());
+        let worker = manager.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorded = calls.clone();
+        *service.test_balance_fetcher.lock() = Some(Arc::new(move |id| {
+            let worker = worker.clone();
+            recorded.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                worker.rotate_balance_token_for_test(id);
+                Ok(exhausted(id))
+            })
+        }));
+        let balance = service.refresh_balance(1, true).await.unwrap();
+        assert_eq!(balance.current_usage, 100.0);
+        assert_eq!(manager.snapshot().entries[0].disabled, auto_disable);
+        assert_eq!(service.balance_cache.lock().len(), 1);
+        // Reuse the result after rotation instead of discarding/refetching it.
+        assert_eq!(service.get_balance(1).await.unwrap().current_usage, 100.0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn normal_rotation_updates_balance_and_disables_exhausted_account() {
+        check_normal_rotation(true).await;
+    }
+
+    #[tokio::test]
+    async fn normal_rotation_updates_balance_when_auto_disable_is_off() {
+        check_normal_rotation(false).await;
+    }
+
+    #[tokio::test]
+    async fn replaced_account_rejects_inflight_balance_without_publishing_cache() {
+        let manager = Arc::new(MultiTokenManager::new(Config::default(), vec![KiroCredentials {
+            id: Some(1), refresh_token: Some("original-fixture-".repeat(12)), ..Default::default()
+        }], None, None, false).unwrap());
+        let service = AdminService::new(manager.clone(), Vec::new());
+        let worker = manager.clone();
+        *service.test_balance_fetcher.lock() = Some(Arc::new(move |id| {
+            let worker = worker.clone();
+            Box::pin(async move {
+                worker.set_disabled(id, true).unwrap();
+                worker.update_refresh_token(id, "replacement-fixture-".repeat(12), None, None).unwrap();
+                worker.set_disabled(id, false).unwrap();
+                Ok(exhausted(id))
+            })
+        }));
+        assert!(service.refresh_balance(1, true).await.is_err());
+        assert!(!manager.snapshot().entries[0].disabled);
+        assert!(service.balance_cache.lock().is_empty());
     }
 }

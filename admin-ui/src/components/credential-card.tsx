@@ -1,3 +1,4 @@
+import { CredentialTrafficControls } from "@/components/traffic-controls";
 import { useState, useEffect, useCallback, memo } from "react";
 import { toast } from "sonner";
 import {
@@ -506,7 +507,7 @@ function CredentialCardImpl({
           toast.success(res.message);
           if (willEnable) onRefreshBalance(credential.id);
         },
-        onError: (err) => toast.error("操作失败: " + (err as Error).message),
+        onError: (err) => toast.error("操作失败: " + extractErrorMessage(err)),
       },
     );
   };
@@ -524,7 +525,7 @@ function CredentialCardImpl({
           toast.success(res.message);
           setEditingPriority(false);
         },
-        onError: (err) => toast.error("操作失败: " + (err as Error).message),
+        onError: (err) => toast.error("操作失败: " + extractErrorMessage(err)),
       },
     );
   };
@@ -532,7 +533,7 @@ function CredentialCardImpl({
   const handleReset = () =>
     resetFailure.mutate(credential.id, {
       onSuccess: (res) => toast.success(res.message),
-      onError: (err) => toast.error("操作失败: " + (err as Error).message),
+      onError: (err) => toast.error("操作失败: " + extractErrorMessage(err)),
     });
 
   const handleForceRefresh = () =>
@@ -544,7 +545,7 @@ function CredentialCardImpl({
   const handleResetSuccess = () =>
     resetSuccess.mutate(credential.id, {
       onSuccess: (res) => toast.success(res.message),
-      onError: (err) => toast.error("重置失败: " + (err as Error).message),
+      onError: (err) => toast.error("重置失败: " + extractErrorMessage(err)),
     });
 
   const handleDelete = () => {
@@ -553,7 +554,7 @@ function CredentialCardImpl({
         toast.success(res.message);
         setShowDeleteDialog(false);
       },
-      onError: (err) => toast.error("删除失败: " + (err as Error).message),
+      onError: (err) => toast.error("删除失败: " + extractErrorMessage(err)),
     });
   };
 
@@ -815,9 +816,6 @@ function CredentialCardImpl({
   // 紧凑列表行 View
   const listView = (
     <div
-      ref={setNodeRef}
-      style={dragStyle}
-      data-credential-id={credential.id}
       className={`group flex min-w-0 items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 transition-colors sm:gap-3 sm:px-3.5 [transform:translateZ(0)] ${railBorderClass(
         disposition.tone,
       )} ${
@@ -1115,7 +1113,10 @@ function CredentialCardImpl({
   return (
     <>
       {view === "list" ? (
-        listView
+        <div ref={setNodeRef} style={dragStyle} data-credential-id={credential.id} className="rounded-lg border bg-card p-2">
+          {listView}
+          {!preview && <CredentialTrafficControls id={credential.id} updatedAt={credential.balanceUpdatedAt} disabledReason={credential.disabledReason} />}
+        </div>
       ) : (
         <Card
           ref={setNodeRef}
@@ -1526,6 +1527,7 @@ function CredentialCardImpl({
                 {moreMenu}
               </div>
             )}
+            {!preview && <CredentialTrafficControls id={credential.id} updatedAt={credential.balanceUpdatedAt} disabledReason={credential.disabledReason} />}
           </CardContent>
         </Card>
       )}

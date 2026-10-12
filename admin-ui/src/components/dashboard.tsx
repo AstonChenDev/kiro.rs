@@ -1,3 +1,4 @@
+import { TrafficProvider, TrafficPoliciesPanel, useTrafficState } from "@/components/traffic-controls";
 import { useState, useEffect, useRef, useDeferredValue, useCallback, useMemo } from "react";
 import {
   RefreshCw,
@@ -134,6 +135,7 @@ import {
   enableOverageForAllCapable,
   exportKamCredentials,
   updateAdminKey,
+  deleteCredential as deleteCredentialRequest,
 } from "@/api/credentials";
 import {
   cn,
@@ -163,6 +165,8 @@ const TIER_OPTIONS: { value: Tier; label: string }[] = [
   { value: "pro", label: "PRO" },
   { value: "pro_plus", label: "PRO+" },
   { value: "power", label: "POWER" },
+  { value: "max", label: "MAX" },
+  { value: "student", label: "STUDENT" },
   { value: "unknown", label: "未知/未查询" },
 ];
 const TIER_LABELS: Record<Tier, string> = {
@@ -170,6 +174,8 @@ const TIER_LABELS: Record<Tier, string> = {
   pro: "PRO",
   pro_plus: "PRO+",
   power: "POWER",
+  max: "MAX",
+  student: "STUDENT",
   unknown: "未知",
 };
 
@@ -257,7 +263,11 @@ const SORT_LABELS: Record<SortField, string> = {
 // 注：PR #56 的 StatusKey / STATUS_OPTIONS / credentialHasStatus 已随「隐藏状态」
 // 下拉一并移除，改由顶部状态账条（StatusStrip + credential-state.ts）承担同一职责。
 
-export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
+export function Dashboard(props: DashboardProps) {
+  return <TrafficProvider><DashboardContent {...props} /></TrafficProvider>;
+}
+
+function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
   const confirm = useConfirm();
   const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false);
@@ -285,6 +295,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     new Map(),
   );
   const [batchDeleting, setBatchDeleting] = useState(false);
+  const batchDeleteLock = useRef(false);
+  const [deleteErrors, setDeleteErrors] = useState<{ id: number; message: string }[]>([]);
   const [deleteProgress, setDeleteProgress] = useState({
     current: 0,
     total: 0,
@@ -332,6 +344,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
 
   const queryClient = useQueryClient();
   const { data, isLoading, error, refetch } = useCredentials();
+  const { rows: trafficRows } = useTrafficState();
   const { mutate: deleteCredential } = useDeleteCredential();
   const { mutate: resetFailure } = useResetFailure();
   const { data: loadBalancingData, isLoading: isLoadingMode } =
@@ -449,7 +462,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
     if (tierFilter.size > 0) {
       out = out.filter((c) =>
-        tierFilter.has(detectTier(c.balance?.subscriptionTitle)),
+        tierFilter.has(trafficRows.find(r => r.id === c.id)?.effective.tier ?? detectTier(c.subscriptionTitle ?? c.balance?.subscriptionTitle)),
       );
     }
     const q = deferredSearchQuery.trim().toLowerCase();
@@ -500,7 +513,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       });
     }
     return out;
-  }, [allCredentials, groupFilter, tierFilter, deferredSearchQuery, stateFilter, balanceMap, sortField, sortDir]);
+  }, [allCredentials, groupFilter, tierFilter, deferredSearchQuery, stateFilter, balanceMap, sortField, sortDir, trafficRows]);
 
   // 各状态计数（状态账条用）。基于全量凭据而非当前筛选结果 ——
   // 账条是导航器，点进某一段之后其余段的数字不该跟着变。
@@ -627,7 +640,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         queryClient.invalidateQueries({ queryKey: ["credentials"] });
       })
       .catch((err) => {
-        toast.error("更新优先级失败: " + (err as Error).message);
+        toast.error("更新优先级失败: " + extractErrorMessage(err));
         setPageOrder(null);
       });
   };
@@ -695,13 +708,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       return;
     }
     const validIds = new Set(data.credentials.map((c) => c.id));
-    setBalanceMap((prev) => {
-      const next = new Map<number, BalanceResponse>();
-      prev.forEach((v, id) => {
-        if (validIds.has(id)) next.set(id, v);
-      });
-      return next.size === prev.size ? prev : next;
-    });
+    setBalanceMap(new Map(data.credentials.filter(c => c.balance).map(c => [c.id, c.balance!])));
     setLoadingBalanceIds((prev) => {
       if (prev.size === 0) return prev;
       const next = new Set<number>();
@@ -775,52 +782,55 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   };
 
   const handleBatchDelete = async () => {
+    if (batchDeleteLock.current) return;
     if (selectedIds.size === 0) {
       toast.error("请先选择要删除的凭据");
       return;
     }
     const ids = Array.from(selectedIds);
-    if (
-      !(await confirm({
-        title: "批量删除凭据",
-        description: `确定要删除 ${ids.length} 个凭据吗？此操作无法撤销。`,
-        confirmText: "删除",
-        destructive: true,
-      }))
-    )
-      return;
-
-    setBatchDeleting(true);
-    setDeleteProgress({ current: 0, total: ids.length });
-    let s = 0;
-    const failedIds = new Set<number>();
+    batchDeleteLock.current = true;
     try {
+      if (!(await confirm({
+        title: "删除选中的凭据",
+        description: `确定删除选中的 ${ids.length} 个凭据吗？包含其他分页及筛选范围外的已选项，未选中的凭据不受影响。此操作无法撤销。`,
+        confirmText: `删除 ${ids.length} 个凭据`,
+        destructive: true,
+      }))) return;
+
+      setBatchDeleting(true);
+      setDeleteErrors([]);
+      setDeleteProgress({ current: 0, total: ids.length });
+      const succeeded = new Set<number>();
+      const failures: { id: number; message: string }[] = [];
       for (let i = 0; i < ids.length; i++) {
         const id = ids[i];
         try {
-          await new Promise<void>((resolve, reject) => {
-            deleteCredential(id, {
-              onSuccess: () => {
-                s++;
-                resolve();
-              },
-              onError: (err) => {
-                reject(err);
-              },
-            });
-          });
-        } catch {
-          failedIds.add(id);
+          // 直接等待请求，避免依赖会随组件卸载或其他删除操作失效的 mutate 回调。
+          await deleteCredentialRequest(id);
+          succeeded.add(id);
+        } catch (error) {
+          failures.push({ id, message: extractErrorMessage(error) });
         }
         setDeleteProgress({ current: i + 1, total: ids.length });
       }
+      setDeleteErrors(failures);
+      setSelectedIds((current) => {
+        const next = new Set(current);
+        succeeded.forEach((id) => next.delete(id));
+        failures.forEach(({ id }) => next.add(id));
+        return next;
+      });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["credentials"] }),
+        queryClient.invalidateQueries({ queryKey: ["credential-traffic"] }),
+        queryClient.invalidateQueries({ queryKey: ["stats"] }),
+      ]);
+      if (failures.length === 0) toast.success(`成功删除 ${succeeded.size} 个凭据`);
+      else toast.warning(`成功删除 ${succeeded.size} 个，失败 ${failures.length} 个；失败项已保留选中，请查看错误详情后重试`);
     } finally {
       setBatchDeleting(false);
+      batchDeleteLock.current = false;
     }
-    const f = failedIds.size;
-    if (f === 0) toast.success(`成功删除 ${s} 个凭据`);
-    else toast.warning(`删除凭据：成功 ${s} 个，失败 ${f} 个`);
-    setSelectedIds(failedIds);
   };
 
   const handleBatchResetFailure = async () => {
@@ -1006,7 +1016,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       });
       toast.success("余额已刷新");
     } catch (err) {
-      toast.error("刷新余额失败: " + (err as Error).message);
+      toast.error("刷新余额失败: " + extractErrorMessage(err));
     } finally {
       setLoadingBalanceIds((prev) => {
         const n = new Set(prev);
@@ -1528,6 +1538,17 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         {/* 状态标签条已下移到紧贴列表处（见下方 <StatusStrip />）：
             它是列表的表头兼筛选器，放在标题下方会与它筛选的列表隔开两行工具栏。 */}
 
+        <TrafficPoliciesPanel />
+
+        {deleteErrors.length > 0 && (
+          <div role="alert" data-no-rect-select className="mb-4 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm">
+            <p className="font-medium text-destructive">{deleteErrors.length} 个凭据删除失败，失败项已保留选中</p>
+            <ul className="mt-2 max-h-40 space-y-1 overflow-y-auto text-xs">
+              {deleteErrors.map(({ id, message }) => <li key={id}>凭据 #{id}：{message}</li>)}
+            </ul>
+          </div>
+        )}
+
         {/* 工具栏 */}
         <div className="mb-5 flex flex-col gap-3">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -1814,6 +1835,19 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 </Button>
               )}
 
+              {selectedIds.size > 0 && (
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  className="w-full sm:w-auto"
+                  onClick={handleBatchDelete}
+                  disabled={batchDeleting}
+                >
+                  {batchDeleting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+                  {batchDeleting ? `删除中 ${deleteProgress.current}/${deleteProgress.total}` : `删除选中 (${selectedIds.size})`}
+                </Button>
+              )}
+
               {/* 刷新按钮 */}
               <Button
                 size="sm"
@@ -1930,7 +1964,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       resetAllSuccess.mutate(undefined, {
                         onSuccess: (res) => toast.success(res.message),
                         onError: (err) =>
-                          toast.error("重置失败: " + (err as Error).message),
+                          toast.error("重置失败: " + extractErrorMessage(err)),
                       });
                     }}
                   >
@@ -1990,7 +2024,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   </DropdownMenuItem>
                   <DropdownMenuItem
                     destructive
-                    disabled={disabledCredentialCount === 0}
+                    disabled={batchDeleting || disabledCredentialCount === 0}
                     onSelect={(e) => {
                       e.preventDefault();
                       handleClearAll();
@@ -2251,7 +2285,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 ) : (
                   <>
                     <Trash2 className="h-3.5 w-3.5" />
-                    删除
+                    删除选中
                   </>
                 )}
               </Button>

@@ -449,6 +449,9 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 pub(super) fn map_provider_error(err: Error) -> Response {
+    if let Some(reason) = crate::kiro::error::credential_error_reason(&err) {
+        return (StatusCode::FORBIDDEN, Json(ErrorResponse::new("permission_error", reason))).into_response();
+    }
     if err
         .downcast_ref::<crate::kiro::error::UpstreamTimeoutError>()
         .is_some()
@@ -610,14 +613,15 @@ fn resolve_non_stream_usage(
     )
 }
 
-fn validate_max_tokens(max_tokens: i32) -> Result<(), ErrorResponse> {
+fn validate_max_tokens(model: &str, max_tokens: i32) -> Result<(), ErrorResponse> {
     if max_tokens <= 0 {
         Err(ErrorResponse::new(
             "invalid_request_error",
             "max_tokens must be greater than 0",
         ))
     } else {
-        Ok(())
+        super::converter::validate_model_output_budget(model, max_tokens)
+            .map_err(|error| ErrorResponse::new("invalid_request_error", error.to_string()))
     }
 }
 
@@ -819,7 +823,7 @@ pub async fn post_messages(
         image_largest_b64_kb = %(img_stats.largest_b64_bytes / 1024),
         "Received POST /v1/messages request"
     );
-    if let Err(error) = validate_max_tokens(payload.max_tokens) {
+    if let Err(error) = validate_max_tokens(&payload.model, payload.max_tokens) {
         return (StatusCode::BAD_REQUEST, Json(error)).into_response();
     }
     if img_stats.total_b64_bytes > IMAGE_BUDGET_WARN_BYTES {
@@ -912,6 +916,7 @@ pub async fn post_messages(
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
+                ConversionError::InvalidMaxTokens(reason) => ("invalid_request_error", reason.clone()),
                 ConversionError::InvalidModel(reason) => {
                     ("invalid_request_error", format!("无效模型 ID: {}", reason))
                 }
@@ -1015,9 +1020,8 @@ pub async fn post_messages(
         )
         .await
     } else {
-        // Responses reasoning requests must expose native reasoning even when the
-        // global Anthropic compatibility flag is disabled; the Responses adapter
-        // explicitly opted into it via `thinking`/`output_config`.
+        // This flag governs legacy text-tag extraction only. Native reasoning
+        // is always returned as a thinking block, including when extraction is off.
         let extract_thinking =
             (state.extract_thinking || payload.output_config.is_some()) && thinking_enabled;
         let tracer = std::sync::Arc::new(RequestTracer::new(
@@ -1122,7 +1126,7 @@ fn create_ping_sse() -> Bytes {
 
 /// 创建 SSE 事件流
 fn create_sse_stream(
-    response: reqwest::Response,
+    response: crate::kiro::traffic::LimitedResponse,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
     hook: UsageRecordHook,
@@ -1137,7 +1141,7 @@ fn create_sse_stream(
     );
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
-    let body_stream = response.bytes_stream();
+    let body_stream = Box::pin(response.bytes_stream());
     let settlement = StreamSettlement::new(hook, credential_id, tracer, &ctx);
 
     let processing_stream = stream::unfold(
@@ -1164,6 +1168,21 @@ fn create_sse_stream(
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
+                                        if frame.event_type() != Some("assistantResponseEvent")
+                                            && frame.event_type() != Some("reasoningContentEvent")
+                                            && frame.event_type() != Some("toolUseEvent")
+                                        {
+                                            let payload = frame.payload_as_json::<serde_json::Value>().ok();
+                                            tracing::info!(
+                                                trace_id = %settlement.tracer.trace_id,
+                                                message_id = %ctx.message_id,
+                                                event_type = ?frame.event_type(),
+                                                message_type = ?frame.message_type(),
+                                                payload_keys = ?payload.as_ref().and_then(|v| v.as_object()).map(|v| v.keys().collect::<Vec<_>>()),
+                                                stop_reason = ?payload.as_ref().and_then(|v| v.get("stopReason")),
+                                                "Upstream control event"
+                                            );
+                                        }
                                         match Event::from_frame(frame) {
                                             Ok(event) => {
                                                 if let Some(error) = upstream_event_error(&event) {
@@ -1513,7 +1532,7 @@ pub(crate) async fn execute_non_stream_request(
     let response = call_result.response;
     let credential_id = call_result.credential_id;
 
-    let mut body_stream = response.bytes_stream();
+    let mut body_stream = Box::pin(response.bytes_stream());
     let mut decoder = EventStreamDecoder::new();
     let mut received_data = false;
 
@@ -1624,6 +1643,9 @@ pub(crate) async fn execute_non_stream_request(
                                 }
                             }
                             Event::Metadata(metadata) => {
+                                if let Some(reason) = metadata.stop_reason_override() {
+                                    stop_reason = reason.to_string();
+                                }
                                 if let Some(usage) = metadata.token_usage {
                                     let usage = usage.sanitized();
                                     tracing::debug!(
@@ -1862,57 +1884,41 @@ fn build_non_stream_content(
     let mut content = Vec::new();
     let has_native_thinking = !native_thinking.is_empty();
 
-    if thinking_enabled {
-        if has_native_thinking {
+    // Preserve upstream type independently of the request's thinking/extraction flags.
+    // The flag continues to govern only the legacy text-tag extraction fallback.
+    let text_content = if has_native_thinking {
+        content.push(json!({
+            "type": "thinking",
+            "thinking": native_thinking,
+            "signature": native_thinking_signature
+                .unwrap_or_else(|| super::stream::THINKING_SIGNATURE_PLACEHOLDER.to_string()),
+        }));
+        text_content
+    } else if thinking_enabled {
+        let (thinking, remaining_text) =
+            super::stream::extract_thinking_from_complete_text(&text_content);
+        if let Some(thinking_text) = thinking {
             content.push(json!({
                 "type": "thinking",
-                "thinking": native_thinking.clone(),
-                "signature": native_thinking_signature
-                    .unwrap_or_else(|| super::stream::THINKING_SIGNATURE_PLACEHOLDER.to_string()),
-            }));
-        } else {
-            // 从完整文本中提取 thinking 块，兼容旧的 <thinking> 文本路径。
-            let (thinking, remaining_text) =
-                super::stream::extract_thinking_from_complete_text(&text_content);
-
-            if let Some(thinking_text) = thinking {
-                content.push(json!({
-                    "type": "thinking",
-                    "thinking": thinking_text,
-                    "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
-                }));
-            }
-
-            if !remaining_text.is_empty() {
-                content.push(json!({
-                    "type": "text",
-                    "text": remaining_text
-                }));
-            }
-        }
-
-        for redacted in native_redacted_thinking {
-            content.push(json!({
-                "type": "redacted_thinking",
-                "data": redacted
+                "thinking": thinking_text,
+                "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
             }));
         }
+        remaining_text
+    } else {
+        text_content
+    };
 
-        if has_native_thinking && !text_content.is_empty() {
-            content.push(json!({
-                "type": "text",
-                "text": text_content
-            }));
-        }
-    } else if !text_content.is_empty() {
+    for redacted in native_redacted_thinking {
+        content.push(json!({
+            "type": "redacted_thinking",
+            "data": redacted
+        }));
+    }
+    if !text_content.is_empty() {
         content.push(json!({
             "type": "text",
             "text": text_content
-        }));
-    } else if has_native_thinking {
-        content.push(json!({
-            "type": "text",
-            "text": native_thinking
         }));
     }
     content
@@ -1994,7 +2000,7 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
-    if let Err(error) = validate_max_tokens(payload.max_tokens) {
+    if let Err(error) = validate_max_tokens(&payload.model, payload.max_tokens) {
         return (StatusCode::BAD_REQUEST, Json(error)).into_response();
     }
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
@@ -2080,6 +2086,7 @@ pub async fn post_messages_cc(
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
+                ConversionError::InvalidMaxTokens(reason) => ("invalid_request_error", reason.clone()),
                 ConversionError::InvalidModel(reason) => {
                     ("invalid_request_error", format!("无效模型 ID: {}", reason))
                 }
@@ -2756,18 +2763,25 @@ mod tests {
     }
 
     #[test]
-    fn non_stream_native_thinking_downgrades_to_text_when_thinking_disabled() {
-        let content = build_non_stream_content(
-            false,
-            String::new(),
-            "native thinking fallback".to_string(),
-            Some("ignored-signature".to_string()),
-            vec!["ignored-redacted".to_string()],
-        );
-
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[0]["text"], "native thinking fallback");
+    fn non_stream_native_thinking_keeps_type_when_extraction_disabled() {
+        for text in ["", "final answer"] {
+            for native in ["", "native thinking"] {
+                let content = build_non_stream_content(
+                    false, text.to_string(), native.to_string(),
+                    Some("real-signature".to_string()), vec!["encrypted-thinking".to_string()],
+                );
+                let thinking: Vec<_> = content.iter().filter(|b| b["type"] == "thinking").collect();
+                assert_eq!(thinking.len(), usize::from(!native.is_empty()));
+                if !native.is_empty() {
+                    assert_eq!(thinking[0]["thinking"], native);
+                    assert_eq!(thinking[0]["signature"], "real-signature");
+                }
+                assert!(content.iter().any(|b| b["type"] == "redacted_thinking" && b["data"] == "encrypted-thinking"));
+                let texts: Vec<_> = content.iter().filter(|b| b["type"] == "text").collect();
+                assert_eq!(texts.len(), usize::from(!text.is_empty()));
+                if !text.is_empty() { assert_eq!(texts[0]["text"], text); }
+            }
+        }
     }
 
     #[test]
@@ -2958,9 +2972,9 @@ mod tests {
 
     #[test]
     fn max_tokens_must_be_positive() {
-        assert!(validate_max_tokens(1).is_ok());
-        assert!(validate_max_tokens(0).is_err());
-        assert!(validate_max_tokens(-1).is_err());
+        assert!(validate_max_tokens("gpt-5.6-sol", 1).is_ok());
+        assert!(validate_max_tokens("gpt-5.6-sol", 0).is_err());
+        assert!(validate_max_tokens("gpt-5.6-sol", -1).is_err());
     }
 
     /// 每个 SSE 响应都要带 `x-accel-buffering: no`。

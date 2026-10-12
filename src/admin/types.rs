@@ -136,6 +136,8 @@ pub struct SetPriorityRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddCredentialRequest {
+    #[serde(default)]
+    pub traffic: crate::kiro::traffic::CredentialTraffic,
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
     pub refresh_token: Option<String>,
 
@@ -1164,6 +1166,7 @@ pub struct ExportedCredentials {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportedAccount {
+    pub traffic: crate::kiro::traffic::CredentialTraffic,
     pub id: String,
     pub email: String,
     #[serde(skip_serializing_if = "Option::is_none")]
