@@ -10,6 +10,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 - Stream CC and Chat Completions content immediately, preserving final usage and tool arguments.
 - Reuse upstream connections; add configurable connection and idle read deadlines.
+- Make the overall upstream request deadline configurable via `upstreamTotalTimeoutSecs`. It still defaults to the previously hardcoded 720s, but an active stream cannot reset it, so that value also caps answer length: raise it where long agentic turns are truncated at twelve minutes, or set 0 to remove the ceiling and rely on the idle read deadline.
 - Return model overloads with 503 and Retry-After without repeated internal attempts.
 - Decode non-streaming answers incrementally; report empty, corrupt, truncated, and interrupted responses as errors.
 - Record first-token latency from content rather than metadata.
