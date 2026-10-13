@@ -166,7 +166,7 @@ impl KiroProvider {
         let config = token_manager.config();
         let initial_client = build_client_with_timeouts(
             proxy.as_ref(),
-            720,
+            config.upstream_total_timeout_secs,
             tls_backend,
             config.upstream_connect_timeout_secs,
             config.upstream_read_timeout_secs,
@@ -196,7 +196,7 @@ impl KiroProvider {
         let config = self.token_manager.config();
         let client = build_client_with_timeouts(
             effective.as_ref(),
-            720,
+            config.upstream_total_timeout_secs,
             self.tls_backend,
             config.upstream_connect_timeout_secs,
             config.upstream_read_timeout_secs,

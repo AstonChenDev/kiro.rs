@@ -116,6 +116,13 @@ pub struct Config {
     #[serde(default = "default_upstream_read_timeout_secs")]
     pub upstream_read_timeout_secs: u64,
 
+    /// Deadline for a whole upstream API request, body included. An active
+    /// stream cannot reset it, so it also caps how long an answer may be.
+    /// Defaults to the previously hardcoded 720s; set 0 to disable it and
+    /// leave stalled upstreams to `upstream_read_timeout_secs`.
+    #[serde(default = "default_upstream_total_timeout_secs")]
+    pub upstream_total_timeout_secs: u64,
+
     /// 外部 count_tokens API 地址（可选）
     #[serde(default)]
     pub count_tokens_api_url: Option<String>,
@@ -397,6 +404,9 @@ fn default_upstream_connect_timeout_secs() -> u64 {
 fn default_upstream_read_timeout_secs() -> u64 {
     120
 }
+fn default_upstream_total_timeout_secs() -> u64 {
+    720
+}
 
 fn default_load_balancing_mode() -> String {
     "priority".to_string()
@@ -494,6 +504,7 @@ impl Default for Config {
             tls_backend: default_tls_backend(),
             upstream_connect_timeout_secs: default_upstream_connect_timeout_secs(),
             upstream_read_timeout_secs: default_upstream_read_timeout_secs(),
+            upstream_total_timeout_secs: default_upstream_total_timeout_secs(),
             count_tokens_api_url: None,
             count_tokens_api_key: None,
             count_tokens_auth_type: default_count_tokens_auth_type(),
@@ -613,6 +624,15 @@ mod tests {
         assert_eq!(Config::default().upstream_read_timeout_secs, 120);
     }
 
+    /// The default keeps the previously hardcoded deadline, so existing
+    /// deployments behave exactly as before this became configurable.
+    #[test]
+    fn upstream_total_timeout_defaults_to_previous_hardcoded_value() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 720);
+        assert_eq!(Config::default().upstream_total_timeout_secs, 720);
+    }
+
     #[test]
     fn upstream_deadlines_accept_explicit_values() {
         let config: Config = serde_json::from_str(
@@ -621,6 +641,20 @@ mod tests {
         .unwrap();
         assert_eq!(config.upstream_connect_timeout_secs, 7);
         assert_eq!(config.upstream_read_timeout_secs, 45);
+    }
+
+    #[test]
+    fn upstream_total_timeout_accepts_explicit_value() {
+        let config: Config = serde_json::from_str(r#"{"upstreamTotalTimeoutSecs":1800}"#).unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 1800);
+    }
+
+    /// 0 is a meaningful setting, not a missing one: it turns the overall
+    /// deadline off for deployments that would rather let long answers finish.
+    #[test]
+    fn upstream_total_timeout_accepts_zero_to_disable() {
+        let config: Config = serde_json::from_str(r#"{"upstreamTotalTimeoutSecs":0}"#).unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 0);
     }
 
     #[test]
