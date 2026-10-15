@@ -507,6 +507,10 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
 
+    /// Previously bound to the static pool; wait for a new IP after automatic release.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub static_ip_required: bool,
+
     /// 凭据级代理认证用户名（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_username: Option<String>,
@@ -1230,6 +1234,7 @@ mod tests {
             email: None,
             subscription_title: None,
             proxy_url: None,
+            static_ip_required: false,
             proxy_username: None,
             proxy_password: None,
             disabled: false,
@@ -1508,6 +1513,7 @@ mod tests {
             email: None,
             subscription_title: None,
             proxy_url: None,
+            static_ip_required: false,
             proxy_username: None,
             proxy_password: None,
             disabled: false,
@@ -1554,6 +1560,7 @@ mod tests {
             email: None,
             subscription_title: None,
             proxy_url: None,
+            static_ip_required: false,
             proxy_username: None,
             proxy_password: None,
             disabled: false,
@@ -1683,6 +1690,7 @@ mod tests {
             email: None,
             subscription_title: None,
             proxy_url: None,
+            static_ip_required: false,
             proxy_username: None,
             proxy_password: None,
             disabled: false,

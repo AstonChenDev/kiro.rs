@@ -150,6 +150,8 @@ const UPDATE_CHECK_TTL_SECS: i64 = 1800;
 struct CachedBalance {
     #[serde(default)]
     traffic_identity: Option<String>,
+    #[serde(default)]
+    auth_fingerprint: Option<String>,
     /// 缓存时间（Unix 秒）
     cached_at: f64,
     /// 缓存的余额数据
@@ -663,7 +665,11 @@ impl AdminService {
         let proxy_pool_path = token_manager.cache_dir().map(|d| d.join("proxy_pool.json"));
         let token_manager_tls_backend = token_manager.config().tls_backend;
 
-        let balance_cache = Self::load_balance_cache_from(&cache_path);
+        let mut balance_cache = Self::load_balance_cache_from(&cache_path);
+        for (id, cached) in &mut balance_cache {
+            cached.traffic_identity = cached.auth_fingerprint.as_deref()
+                .and_then(|fingerprint| token_manager.restore_balance_cache_identity(*id, fingerprint));
+        }
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
         let credential_metadata_schema =
             match token_manager.config().credential_metadata_schema.clone() {
@@ -720,6 +726,9 @@ impl AdminService {
             });
         }
 
+        // Persist the validated startup generation so a later token rotation can
+        // safely update this account's cache association without relying on its ID.
+        if !svc.balance_cache.lock().is_empty() { svc.save_balance_cache(); }
         svc
     }
 
@@ -1045,6 +1054,8 @@ impl AdminService {
         self.apply_balance_quota_policy(&balance, &identity)?;
         let now = Utc::now();
         self.balance_cache.lock().insert(id, CachedBalance {
+            auth_fingerprint: Some(self.token_manager.balance_cache_fingerprint(id, &identity)
+                .map_err(|e| self.classify_error(e, id))?),
             traffic_identity: Some(identity.clone()),
             cached_at: now.timestamp() as f64 + now.timestamp_subsec_nanos() as f64 / 1e9,
             data: balance.clone(),
@@ -1054,8 +1065,7 @@ impl AdminService {
     }
 
     fn apply_balance_quota_policy(&self, balance: &BalanceResponse, identity: &str) -> Result<(), AdminServiceError> {
-        let policy = self.token_manager.traffic_policies();
-        self.token_manager.apply_traffic_quota(balance.id, identity, should_disable_balance(balance, &policy))
+        self.token_manager.apply_traffic_quota(balance.id, identity, |policy| should_disable_balance(balance, policy))
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
         Ok(())
     }
@@ -1596,6 +1606,7 @@ impl AdminService {
             email: req.email,
             subscription_title: None, // 将在首次获取使用额度时自动更新
             proxy_url: req.proxy_url,
+            static_ip_required: false,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
@@ -1805,6 +1816,9 @@ impl AdminService {
                 ));
             }
         }
+
+        let _static_guard = self.token_manager.guard_static_global_proxy(url.as_deref())
+            .map_err(|e| AdminServiceError::InvalidRequest(e.to_string()))?;
 
         let username_for_save = username.clone().filter(|s| !s.is_empty());
         let current_password = self.token_manager.proxy().and_then(|proxy| proxy.password);
@@ -2939,24 +2953,15 @@ impl AdminService {
     }
 
     fn save_balance_cache(&self) {
-        let path = match &self.cache_path {
-            Some(p) => p,
-            None => return,
-        };
-
-        // 持有锁期间完成序列化和写入，防止并发损坏
+        let Some(path) = &self.cache_path else { return; };
         let cache = self.balance_cache.lock();
-        let map: HashMap<String, &CachedBalance> =
-            cache.iter().map(|(k, v)| (k.to_string(), v)).collect();
-
-        match serde_json::to_string_pretty(&map) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
-                    tracing::warn!("保存余额缓存失败: {}", e);
-                }
-            }
-            Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
-        }
+        let _disk_guard = self.token_manager.balance_cache_write_lock.lock();
+        let result = (|| -> anyhow::Result<()> {
+            let mut value = serde_json::to_value(&*cache)?;
+            self.token_manager.update_balance_cache_fingerprints(&mut value);
+            MultiTokenManager::write_balance_cache_file(path, &value)
+        })();
+        if let Err(error) = result { tracing::warn!("保存余额缓存失败: {}", error); }
     }
 
     // ============ 代理池管理 ============
@@ -3101,6 +3106,7 @@ impl AdminService {
                 None,            // metadata 不修改
             )
             .map_err(|e| {
+                if e.downcast_ref::<crate::kiro::token_manager::static_ips::StaticIpError>().is_some() { return AdminServiceError::InvalidRequest(e.to_string()); }
                 let msg = e.to_string();
                 if msg.contains("不存在") {
                     AdminServiceError::NotFound { id: credential_id }
@@ -3194,6 +3200,7 @@ impl AdminService {
 
     /// 分类简单操作错误（set_disabled, set_priority, reset_and_enable）
     fn classify_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        if e.downcast_ref::<crate::kiro::token_manager::static_ips::StaticIpError>().is_some() { return AdminServiceError::InvalidRequest(e.to_string()); }
         if let Some(reason) = crate::kiro::error::credential_error_reason(&e) { return AdminServiceError::InvalidCredential(reason); }
         if let Some(error) = classify_rate_limit(&e) {
             return error;
@@ -3208,6 +3215,7 @@ impl AdminService {
 
     /// 分类余额查询错误（可能涉及上游 API 调用）
     fn classify_balance_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        if e.downcast_ref::<crate::kiro::token_manager::static_ips::StaticIpError>().is_some() { return AdminServiceError::InvalidRequest(e.to_string()); }
         if let Some(reason) = crate::kiro::error::credential_error_reason(&e) { return AdminServiceError::InvalidCredential(reason); }
         if let Some(error) = classify_rate_limit(&e) {
             return error;
@@ -3269,6 +3277,7 @@ impl AdminService {
 
     /// 分类添加凭据错误
     fn classify_add_error(&self, e: anyhow::Error) -> AdminServiceError {
+        if e.downcast_ref::<crate::kiro::token_manager::static_ips::StaticIpError>().is_some() { return AdminServiceError::InvalidRequest(e.to_string()); }
         if let Some(reason) = crate::kiro::error::credential_error_reason(&e) { return AdminServiceError::InvalidCredential(reason); }
         if let Some(error) = classify_rate_limit(&e) {
             return error;
@@ -3301,6 +3310,37 @@ impl AdminService {
     }
 
     // ── Social 登录（Portal PKCE OAuth）────────────────────────────────────────
+
+    /// Guard only the current network operation, never the idle OAuth session.
+    /// Session proxy snapshots must still belong to the target when used again.
+    #[cfg(test)]
+    fn pin_login_proxy(
+        &self,
+        target_id: Option<u64>,
+        proxy: Option<&ProxyConfig>,
+    ) -> Result<crate::kiro::token_manager::static_ips::ProxyUse, AdminServiceError> {
+        let credentials = match target_id {
+            Some(id) => self.token_manager.clone_credential(id)
+                .ok_or(AdminServiceError::NotFound { id })?,
+            None => KiroCredentials::default(),
+        };
+        self.token_manager.pin_proxy_use(&credentials, proxy)
+            .map_err(|e| AdminServiceError::InvalidRequest(e.to_string()))
+    }
+
+    async fn prepare_login_proxy(
+        &self,
+        target_id: Option<u64>,
+        proxy: Option<&ProxyConfig>,
+    ) -> Result<crate::kiro::token_manager::static_ips::ProxyUse, AdminServiceError> {
+        let credentials = match target_id {
+            Some(id) => self.token_manager.clone_credential(id)
+                .ok_or(AdminServiceError::NotFound { id })?,
+            None => KiroCredentials::default(),
+        };
+        self.token_manager.prepare_proxy_use(&credentials, proxy).await
+            .map_err(|e| AdminServiceError::InvalidRequest(e.to_string()))
+    }
 
     /// 发起 Social 登录，返回 portal URL 供用户在浏览器打开
     ///
@@ -3469,13 +3509,14 @@ impl AdminService {
             )
         };
 
+        let _proxy_use = self.prepare_login_proxy(session.relogin_target_id, session.proxy.as_ref()).await?;
         let token = social::exchange_code_for_token(
             &session.auth_endpoint,
             &callback.code,
             &session.code_verifier,
             &full_redirect_uri,
             config,
-            session.proxy.as_ref(),
+            _proxy_use.proxy(),
         )
         .await
         .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
@@ -3553,6 +3594,7 @@ impl AdminService {
 
     /// 分类删除凭据错误
     fn classify_delete_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        if e.downcast_ref::<crate::kiro::token_manager::static_ips::StaticIpError>().is_some() { return AdminServiceError::InvalidRequest(e.to_string()); }
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
@@ -3607,9 +3649,10 @@ impl AdminService {
         relogin_target_id: Option<u64>,
     ) -> Result<StartIdcLoginResponse, AdminServiceError> {
         let config = self.token_manager.config();
+        let _proxy_use = self.prepare_login_proxy(relogin_target_id, proxy.as_ref()).await?;
 
         // 1. 注册 OIDC 客户端
-        let reg = idc::register_client(&region, &start_url, config, proxy.as_ref())
+        let reg = idc::register_client(&region, &start_url, config, _proxy_use.proxy())
             .await
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
@@ -3620,7 +3663,7 @@ impl AdminService {
             &reg.client_id,
             &reg.client_secret,
             config,
-            proxy.as_ref(),
+            _proxy_use.proxy(),
         )
         .await
         .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
@@ -3701,13 +3744,14 @@ impl AdminService {
 
         let config = self.token_manager.config();
 
+        let _proxy_use = self.prepare_login_proxy(relogin_target_id, proxy.as_ref()).await?;
         match idc::poll_token(
             &region,
             &client_id,
             &client_secret,
             &device_code,
             config,
-            proxy.as_ref(),
+            _proxy_use.proxy(),
         )
         .await
         {
@@ -3959,7 +4003,7 @@ mod tests {
     #[test]
     fn quota_recovery_uses_own_reset_time_before_fallback() {
         let balance = |next_reset_at| CachedBalance {
-            traffic_identity: None,
+            traffic_identity: None, auth_fingerprint: None,
             cached_at: 1.0,
             data: BalanceResponse {
                 id: 1,
@@ -4237,8 +4281,8 @@ mod traffic_quota_tests {
                 Ok(test_balance(id, if id == 1 { 100.0 } else { 10.0 }))
             })
         }));
-        service.balance_cache.lock().insert(1, CachedBalance { traffic_identity: None, cached_at: Utc::now().timestamp() as f64, data: test_balance(1, 0.0) });
-        service.balance_cache.lock().insert(3, CachedBalance { traffic_identity: None, cached_at: Utc::now().timestamp() as f64, data: test_balance(3, 5.0) });
+        service.balance_cache.lock().insert(1, CachedBalance { traffic_identity: None, auth_fingerprint: None, cached_at: Utc::now().timestamp() as f64, data: test_balance(1, 0.0) });
+        service.balance_cache.lock().insert(3, CachedBalance { traffic_identity: None, auth_fingerprint: None, cached_at: Utc::now().timestamp() as f64, data: test_balance(3, 5.0) });
         let (a, b) = tokio::join!(service.refresh_balance(1, true), service.refresh_balance(1, true));
         assert_eq!(a.unwrap().current_usage, 100.0);
         assert_eq!(b.unwrap().current_usage, 100.0);
@@ -4389,5 +4433,146 @@ mod traffic_balance_rotation_tests {
         assert!(service.refresh_balance(1, true).await.is_err());
         assert!(!manager.snapshot().entries[0].disabled);
         assert!(service.balance_cache.lock().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod static_login_tests {
+    use super::*;
+    fn fixture(port: u16) -> (Arc<MultiTokenManager>, Arc<AdminService>, ProxyConfig) {
+        let credentials=(1..=2).map(|id| KiroCredentials { id:Some(id),auth_method:Some("idc".into()),provider:Some("BuilderId".into()),client_id:Some("fixture-client".into()),client_secret:Some("fixture-secret".into()),refresh_token:Some(format!("fixture-{id}").repeat(120)),access_token:Some("fixture-access".into()),expires_at:Some("2099-01-01T00:00:00Z".into()),..Default::default() }).collect();
+        let m=Arc::new(MultiTokenManager::new(Config::default(),credentials,None,None,true).unwrap());
+        m.static_ip_config(None,Some(vec!["builderid".into()])).unwrap();
+        m.static_ip_import(vec![crate::kiro::token_manager::static_ips::StaticIpInput {host:"127.0.0.1".into(),port,protocol:"http".into(),username:None,password:None,label:None}]).unwrap();
+        m.static_ip_bind(1,Some(1)).unwrap();
+        let service=Arc::new(AdminService::new(m.clone(),Vec::new()));
+        (m,service,ProxyConfig::new(format!("http://127.0.0.1:{port}")))
+    }
+    fn idc_request(proxy: &ProxyConfig) -> StartIdcLoginRequest {
+        StartIdcLoginRequest {region:"us-east-1".into(),start_url:None,priority:0,email:None,proxy_url:Some(proxy.url.clone())}
+    }
+    fn add_idc_session(service: &AdminService, proxy: &ProxyConfig, expired: bool) {
+        service.idc_sessions.lock().insert("fixture".into(),IdcAuthSession {
+            region:"us-east-1".into(),start_url:BUILDER_ID_START_URL.into(),client_id:"fixture".into(),client_secret:"fixture".into(),device_code:"fixture".into(),
+            expires_at:Utc::now()+Duration::seconds(if expired {-1} else {60}),poll_interval:5,cred_template:KiroCredentials::default(),proxy:Some(proxy.clone()),relogin_target_id:Some(1),
+        });
+    }
+    async fn add_social_session(service: &AdminService, proxy: &ProxyConfig) -> (String,String) {
+        let req=serde_json::from_value(serde_json::json!({"proxyUrl":proxy.url,"authEndpoint":"https://example.invalid"})).unwrap();
+        let started=service.start_social_relogin(1,req).await.unwrap();
+        let state=service.social_sessions.lock().get(&started.session_id).unwrap().state.clone();
+        (started.session_id,state)
+    }
+    #[tokio::test]
+    async fn login_pins_static_binding_but_ordinary_proxies_stay_shared() {
+        let (m,s,proxy)=fixture(3000);let a=s.pin_login_proxy(Some(1),Some(&proxy)).unwrap();let b=s.pin_login_proxy(Some(1),Some(&proxy)).unwrap();
+        m.set_disabled(1,true).unwrap();assert_eq!(m.static_ip_list().entries[0].status,"releasing");
+        assert!(m.static_ip_bind(2,Some(1)).is_err());assert!(m.delete_credential(1).is_err());
+        drop(a);assert_eq!(m.static_ip_list().entries[0].status,"releasing");drop(b);
+        assert_eq!(m.static_ip_list().entries[0].status,"free");m.static_ip_bind(2,Some(1)).unwrap();
+        assert!(matches!(s.pin_login_proxy(Some(1),Some(&proxy)),Err(AdminServiceError::InvalidRequest(_))));
+        assert!(s.pin_login_proxy(Some(2),Some(&proxy)).is_ok());
+        let ordinary=ProxyConfig::new("http://192.0.2.1:3000");
+        let _a=s.pin_login_proxy(Some(1),Some(&ordinary)).unwrap();let _b=s.pin_login_proxy(None,Some(&ordinary)).unwrap();
+        assert!(s.pin_login_proxy(None,None).is_ok());
+    }
+    #[tokio::test]
+    async fn login_entry_points_recheck_old_session_proxy_ownership() {
+        let (m,s,proxy)=fixture(3000);add_idc_session(&s,&proxy,false);
+        let (social,state)=add_social_session(&s,&proxy).await;
+        // Idle authorization sessions must not hold a static IP.
+        m.set_disabled(1,true).unwrap();assert_eq!(m.static_ip_list().entries[0].status,"free");m.static_ip_bind(2,Some(1)).unwrap();
+        assert!(matches!(s.start_idc_relogin(1,idc_request(&proxy)).await,Err(AdminServiceError::InvalidRequest(_))));
+        assert!(matches!(s.start_idc_login(idc_request(&proxy)).await,Err(AdminServiceError::InvalidRequest(_))));
+        assert!(matches!(s.poll_idc_login("fixture").await,Err(AdminServiceError::InvalidRequest(_))));
+        assert!(matches!(s.complete_social_login(&social,"fixture-code".into(),state,"".into(),"/".into()).await,Err(AdminServiceError::InvalidRequest(_))));
+        assert_eq!(m.static_ip_list().entries[0].credential_ids,vec![2]);
+        add_idc_session(&s,&proxy,true);assert!(matches!(s.poll_idc_login("fixture").await.unwrap(),PollIdcLoginResponse::Expired));
+        m.delete_credential(1).unwrap();add_idc_session(&s,&proxy,false);
+        assert!(matches!(s.poll_idc_login("fixture").await,Err(AdminServiceError::NotFound {id:1})));
+    }
+    #[tokio::test]
+    async fn login_network_cancellation_and_failure_release_static_binding() {
+        use tokio::io::AsyncReadExt;
+        for mode in ["idc_start","idc_poll","social"] {
+            for cancel in [false,true] {
+                let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let (m,s,proxy)=fixture(listener.local_addr().unwrap().port());
+                add_idc_session(&s,&proxy,false);let social=add_social_session(&s,&proxy).await;
+                let task=tokio::spawn(async move {
+                    match mode {
+                        "idc_start" => s.start_idc_relogin(1,idc_request(&proxy)).await.map(|_| ()),
+                        "idc_poll" => s.poll_idc_login("fixture").await.map(|_| ()),
+                        _ => s.complete_social_login(&social.0,"fixture-code".into(),social.1,"".into(),"/".into()).await.map(|_| ()),
+                    }
+                });
+                let (mut socket,_)=tokio::time::timeout(std::time::Duration::from_secs(3),listener.accept()).await.unwrap().unwrap();
+                let mut bytes=[0;1024];assert!(socket.read(&mut bytes).await.unwrap()>0);
+                m.set_disabled(1,true).unwrap();assert_eq!(m.static_ip_list().entries[0].status,"releasing", "{mode}");
+                assert!(m.static_ip_bind(2,Some(1)).is_err());
+                if cancel { task.abort();assert!(task.await.unwrap_err().is_cancelled());drop(socket); }
+                else { drop(socket);assert!(tokio::time::timeout(std::time::Duration::from_secs(3),task).await.unwrap().unwrap().is_err()); }
+                assert_eq!(m.static_ip_list().entries[0].status,"free", "{mode}");
+                m.static_ip_bind(2,Some(1)).unwrap();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod full_audit_cache_restart {
+    use super::*;
+    #[tokio::test(flavor="multi_thread",worker_threads=2)]
+    async fn audit_saved_balance_remains_visible_after_restart_and_failed_refresh() { check_cache_restart(false, 0).await; }
+    #[tokio::test(flavor="multi_thread",worker_threads=2)]
+    async fn replaced_authentication_cannot_restore_saved_balance() { check_cache_restart(true, 0).await; }
+    #[tokio::test(flavor="multi_thread",worker_threads=2)]
+    async fn normal_rotation_keeps_cache_across_restart_and_later_cache_save() { check_cache_restart(false, 1).await; }
+    #[tokio::test(flavor="multi_thread",worker_threads=2)]
+    async fn normal_rotation_persists_cache_identity_without_another_balance_save() { check_cache_restart(false, 2).await; }
+    #[tokio::test(flavor="multi_thread",worker_threads=2)]
+    async fn concurrent_token_and_cache_writes_preserve_rotation_association() { check_cache_restart(false, 3).await; }
+    async fn check_cache_restart(replaced: bool, rotated: u8) {
+        let dir=std::env::temp_dir().join(format!("kiro-full-audit-{}",Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();let path=dir.join("credentials.json");
+        let c=KiroCredentials{id:Some(1),auth_method:Some("social".into()),provider:Some("Github".into()),refresh_token:Some("audit-fake-refresh-token".repeat(10)),..Default::default()};
+        let manager=Arc::new(MultiTokenManager::new(Config::default(),vec![c],None,Some(path.clone()),true).unwrap());
+        let service=Arc::new(AdminService::new(manager.clone(),Vec::new()));
+        *service.test_balance_fetcher.lock()=Some(Arc::new(|id|Box::pin(async move {Ok(BalanceResponse{
+            id,subscription_title:Some("KIRO POWER".into()),current_usage:25.0,usage_limit:100.0,remaining:75.0,usage_percentage:25.0,
+            next_reset_at:None,overage_enabled:Some(false),overage_capable:Some(false),overage_capability_raw:None,
+        })})));
+        service.refresh_balance(1,true).await.unwrap();
+        assert!(service.get_all_credentials().credentials[0].balance.is_some());
+        let old_id=manager.balance_identity(1).unwrap();
+        if rotated > 0 {
+            if rotated == 3 {
+                let worker=manager.clone();let cache=service.clone();
+                let rotation=tokio::task::spawn_blocking(move || {
+                    for _ in 0..20 { worker.rotate_balance_token_for_test(1);worker.persist_balance_rotation_for_test(); }
+                });
+                let saves=tokio::task::spawn_blocking(move || { for _ in 0..20 { cache.save_balance_cache(); } });
+                rotation.await.unwrap();saves.await.unwrap();
+            } else {
+                manager.rotate_balance_token_for_test(1);
+                manager.persist_balance_rotation_for_test();
+            }
+            assert_eq!(manager.balance_identity(1).unwrap(), old_id);
+            // Saving another result must not overwrite the rotated fingerprint
+            // with the stale association still held by this in-memory cache.
+            if rotated == 1 { service.save_balance_cache(); }
+        }
+        drop(service);drop(manager);
+        let mut same_credentials:Vec<KiroCredentials>=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        if replaced { same_credentials[0].refresh_token=Some("other-account-fixture".repeat(12)); }
+        let manager=Arc::new(MultiTokenManager::new(Config::default(),same_credentials,None,Some(path.clone()),true).unwrap());
+        let service=AdminService::new(manager.clone(),Vec::new());
+        *service.test_balance_fetcher.lock()=Some(Arc::new(|_|Box::pin(async {Err(AdminServiceError::UpstreamError("fixture offline".into()))})));
+        assert!(service.refresh_balance(1,true).await.is_err());
+        let preserved=service.balance_cache.lock().get(&1).unwrap().data.remaining;
+        let visible=service.get_all_credentials().credentials[0].balance.is_some();
+        eprintln!("EVIDENCE same-auth restart: persisted remaining={preserved}, identity_changed={}, visible_after_failed_refresh={visible}",old_id!=manager.balance_identity(1).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(visible,!replaced,"only unchanged authentication may recover last-known balance after restart");
     }
 }

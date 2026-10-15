@@ -10,7 +10,7 @@ function fixture(remove: (id: number) => Promise<void>, confirm: () => Promise<b
   let failures: { id: number; message: string }[] = []
   const lock = { current: false }; const messages: string[] = []; const invalidate: string[] = []
   const args = {
-    selectedIds: selected, batchDeleteLock: lock, confirm, deleteCredentialRequest: remove,
+    selectedIds: selected, batchDeleteLock: lock, batchDisableLock: { current: false }, confirm, deleteCredentialRequest: remove,
     setBatchDeleting: (value: boolean) => { busy = value },
     setDeleteErrors: (value: typeof failures) => { failures = value }, setDeleteProgress: () => {},
     setSelectedIds: (update: (old: Set<number>) => Set<number>) => { selected = update(selected) },

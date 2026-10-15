@@ -423,29 +423,31 @@ async fn gateway_native_reasoning_stays_separate_across_models_and_protocols() {
 
 #[tokio::test]
 async fn gateway_forwards_output_budget_and_preserves_limit_reason_across_protocols() {
-    for endpoint in ["messages", "cc", "chat", "responses"] {
-        for streaming in [false, true] {
-            for budget in [64000, 128000] {
-                let f = fixture(Mode::OutputLimit).await;
-                let req = json!({
-                    "model":"claude-opus-4-6", "stream":streaming,
-                    "max_tokens":budget, "max_output_tokens":budget,
-                    "messages":[{"role":"user", "content":"hello"}], "input":"hello"
-                });
-                let response = request_payload(f.state.clone(), endpoint, req).await;
-                assert_eq!(response.status(), StatusCode::OK, "{endpoint} stream={streaming}");
-                let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-                let body = String::from_utf8(bytes.to_vec()).unwrap();
-                let expected = match endpoint {
-                    "chat" => "\"finish_reason\":\"length\"",
-                    "responses" => "\"status\":\"incomplete\"",
-                    _ => "\"stop_reason\":\"max_tokens\"",
-                };
-                assert!(body.contains(expected), "{endpoint} stream={streaming}: {body}");
-                assert!(body.contains("unfinished sentence"), "{body}");
-                let requests = f.requests.lock();
-                assert_eq!(requests.len(), 1);
-                assert_eq!(requests[0]["additionalModelRequestFields"]["max_tokens"], 64000);
+    for model in ["claude-opus-4-6", "claude-opus-4-8", "claude-opus-5-5"] {
+        for endpoint in ["messages", "cc", "chat", "responses"] {
+            for streaming in [false, true] {
+                for budget in [64000, 128000] {
+                    let f = fixture(Mode::OutputLimit).await;
+                    let req = json!({
+                        "model":model, "stream":streaming,
+                        "max_tokens":budget, "max_output_tokens":budget,
+                        "messages":[{"role":"user", "content":"hello"}], "input":"hello"
+                    });
+                    let response = request_payload(f.state.clone(), endpoint, req).await;
+                    assert_eq!(response.status(), StatusCode::OK, "{endpoint} stream={streaming}");
+                    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                    let body = String::from_utf8(bytes.to_vec()).unwrap();
+                    let expected = match endpoint {
+                        "chat" => "\"finish_reason\":\"length\"",
+                        "responses" => "\"status\":\"incomplete\"",
+                        _ => "\"stop_reason\":\"max_tokens\"",
+                    };
+                    assert!(body.contains(expected), "{endpoint} stream={streaming}: {body}");
+                    assert!(body.contains("unfinished sentence"), "{body}");
+                    let requests = f.requests.lock();
+                    assert_eq!(requests.len(), 1);
+                    assert_eq!(requests[0]["additionalModelRequestFields"]["max_tokens"], if model == "claude-opus-4-6" {64000} else {budget});
+                }
             }
         }
     }

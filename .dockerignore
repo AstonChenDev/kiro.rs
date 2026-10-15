@@ -91,3 +91,6 @@ docker-compose.*.yml
 .ace-tool/
 .codegraph/
 .claude/
+
+# Local static proxy inventory contains authentication data
+static_ips.json

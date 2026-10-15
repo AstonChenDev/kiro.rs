@@ -162,6 +162,7 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+    token_manager.start_static_ip_maintenance();
     token_manager.start_model_cache_warmer();
     let kiro_provider = Arc::new(KiroProvider::with_proxy(
         token_manager.clone(),

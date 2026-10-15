@@ -13,7 +13,7 @@ impl AccountTier {
         // Match whole normalized names, not arbitrary substrings (e.g. PROMO).
         match title.trim().strip_prefix("KIRO ").unwrap_or(title.trim()).trim() {
             "FREE" => Self::Free, "PRO" => Self::Pro,
-            "PRO+" | "PRO PLUS" => Self::ProPlus, "MAX" => Self::Max,
+            "PRO+" | "PRO PLUS" => Self::ProPlus, "MAX" | "PRO MAX" => Self::Max,
             "POWER" => Self::Power, "STUDENT" => Self::Student, _ => Self::Unknown,
         }
     }
@@ -111,22 +111,28 @@ impl Drop for TrafficPermit {
 }
 
 /// Keep the permit with the response body, including while a stream is suspended.
-pub struct LimitedResponse { response: reqwest::Response, permit: TrafficPermit }
+pub struct LimitedResponse {
+    response: reqwest::Response, permit: TrafficPermit,
+    proxy_use: Option<super::token_manager::static_ips::ProxyUse>,
+}
 impl LimitedResponse {
-    pub fn new(response: reqwest::Response, permit: TrafficPermit) -> Self { Self { response, permit } }
+    pub fn new(response: reqwest::Response, permit: TrafficPermit) -> Self { Self { response, permit, proxy_use: None } }
+    pub(crate) fn with_proxy_use(mut self, proxy_use: super::token_manager::static_ips::ProxyUse) -> Self {
+        self.proxy_use=Some(proxy_use); self
+    }
     pub async fn text(self) -> Result<String, reqwest::Error> {
-        let Self { response, permit: _permit } = self;
+        let Self { response, permit: _permit, proxy_use: _proxy_use } = self;
         response.text().await
     }
     pub async fn bytes(self) -> Result<bytes::Bytes, reqwest::Error> {
-        let Self { response, permit: _permit } = self;
+        let Self { response, permit: _permit, proxy_use: _proxy_use } = self;
         response.bytes().await
     }
     pub fn status(&self) -> reqwest::StatusCode { self.response.status() }
     pub fn bytes_stream(self) -> impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> {
-        let Self { response, permit } = self;
-        futures::stream::unfold((Box::pin(response.bytes_stream()), permit), |(mut stream, permit)| async move {
-            stream.next().await.map(|chunk| (chunk, (stream, permit)))
+        let Self { response, permit, proxy_use } = self;
+        futures::stream::unfold((Box::pin(response.bytes_stream()), permit, proxy_use), |(mut stream, permit, proxy_use)| async move {
+            stream.next().await.map(|chunk| (chunk, (stream, permit, proxy_use)))
         })
     }
 }
@@ -151,6 +157,30 @@ mod tests {
         assert_eq!(effective.concurrency_source, "credential");
         assert_eq!(effective.rpm_source, "tier");
     }
+    #[test]
+    fn pro_max_subscription_uses_max_policy_and_preserves_account_overrides() {
+        for title in ["KIRO PRO MAX", "PRO MAX", " kiro pro max ", "KIRO MAX", "MAX"] {
+            assert_eq!(AccountTier::detect(Some(title)), AccountTier::Max);
+        }
+        for title in ["KIRO PRO MAXIMUM", "PROMO MAX", "MAX TRIAL"] {
+            assert_eq!(AccountTier::detect(Some(title)), AccountTier::Unknown);
+        }
+        let mut policies = TrafficPolicies::default();
+        policies.tiers.insert(AccountTier::Max, Limits { concurrency: Some(100), rpm: Some(50) });
+        policies.tiers.insert(AccountTier::Power, Limits { concurrency: Some(200), rpm: Some(100) });
+        let inherited = policies.resolve(&CredentialTraffic::default(), Some("KIRO PRO MAX"), 60);
+        assert_eq!(inherited.tier, AccountTier::Max);
+        assert_eq!((inherited.concurrency, inherited.rpm), (100, 50));
+        assert_eq!((inherited.concurrency_source.as_str(), inherited.rpm_source.as_str()), ("tier", "tier"));
+        let own = CredentialTraffic { concurrency: Some(15), rpm: Some(10), ..Default::default() };
+        let effective = policies.resolve(&own, Some("KIRO PRO MAX"), 60);
+        assert_eq!((effective.concurrency, effective.rpm), (15, 10));
+        let manual = CredentialTraffic { tier: Some(AccountTier::Power), ..Default::default() };
+        let effective = policies.resolve(&manual, Some("KIRO PRO MAX"), 60);
+        assert_eq!(effective.tier, AccountTier::Power);
+        assert_eq!((effective.concurrency, effective.rpm), (200, 100));
+    }
+
     #[test]
     fn all_six_tiers_and_unknown_are_distinct() {
         for (title, tier) in [("FREE", AccountTier::Free), ("PRO", AccountTier::Pro),

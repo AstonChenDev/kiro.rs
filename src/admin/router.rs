@@ -69,6 +69,11 @@ const MAX_ADMIN_BODY_SIZE: usize = 50 * 1024 * 1024;
 pub fn create_admin_router(state: AdminState) -> Router {
     // 需要登录API密钥认证的路由
     let authenticated = Router::new()
+        .route("/static-ips", get(super::handlers::static_ips_list).post(super::handlers::static_ips_import))
+        .route("/static-ips/config", put(super::handlers::static_ips_config))
+        .route("/static-ips/{id}", delete(super::handlers::static_ips_delete))
+        .route("/static-ips/{id}/enabled", put(super::handlers::static_ips_enabled))
+        .route("/credentials/{id}/static-ip", put(super::handlers::static_ips_bind))
         .route("/config/traffic-policies", get(super::handlers::traffic_policies).put(super::handlers::set_traffic_policies).patch(super::handlers::patch_traffic_policies))
         .route("/credentials/traffic", get(super::handlers::traffic_status))
         .route("/credentials/{id}/traffic", put(super::handlers::set_credential_traffic))

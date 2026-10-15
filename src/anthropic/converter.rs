@@ -538,11 +538,18 @@ fn build_additional_model_request_fields(
     model_id: &str,
 ) -> Result<Option<AdditionalModelRequestFields>, ConversionError> {
     let mut fields = build_reasoning_request_fields(req, model_id);
-    // Confirmed by Opus 4.6's upstream schema and real requests. Do not infer
-    // support from reasoning capability: other models reject this field.
-    if model_id == "claude-opus-4.6" {
-        validate_model_output_budget(model_id, req.max_tokens)?;
-        let effective_max_tokens = req.max_tokens.min(64000);
+    // Forward explicit output budgets for the Opus family independently of
+    // reasoning. Only Opus 4.6 retains its established 64000 cap/minimum.
+    // Other families keep their existing schema; the upstream validates limits
+    // for other Opus versions rather than silently dropping the requested budget.
+    let normalized_model = model_id.to_ascii_lowercase();
+    if normalized_model.starts_with("claude-opus-") {
+        let effective_max_tokens = if normalized_model == "claude-opus-4.6" {
+            validate_model_output_budget(model_id, req.max_tokens)?;
+            req.max_tokens.min(64000)
+        } else {
+            req.max_tokens
+        };
         if effective_max_tokens != req.max_tokens {
             tracing::info!(
                 model_id,
@@ -2417,6 +2424,35 @@ mod tests {
     }
 
     #[test]
+    fn other_opus_versions_forward_requested_budget_without_changing_reasoning() {
+        for model in ["claude-opus-4-5", "claude-opus-4.7", "claude-opus-4-8",
+            "claude-opus-5", "claude-opus-5-5", "claude-opus-5.5",
+            "CLAUDE-OPUS-5-5", "claude-opus-5-5-thinking", "claude-3-opus-20240229"] {
+            for mode in [None, Some("disabled"), Some("enabled"), Some("adaptive")] {
+                for budget in [1, 1024, 64000, 128000] {
+                    let mut req = minimal_thinking_request(model, mode.unwrap_or("disabled"));
+                    if mode.is_none() { req.thinking = None; }
+                    req.max_tokens = budget;
+                    let mapped = map_model(model).unwrap();
+                    let expected_reasoning = build_reasoning_request_fields(&req, &mapped);
+                    let fields = convert_request(&req).unwrap().additional_model_request_fields.unwrap();
+                    assert_eq!(fields.max_tokens, Some(budget), "{model} {mode:?}");
+                    let actual = serde_json::to_value(&fields).unwrap();
+                    let expected = serde_json::to_value(expected_reasoning).unwrap();
+                    assert_eq!(actual.get("output_config"), expected.get("output_config"));
+                    assert_eq!(actual.get("reasoning"), expected.get("reasoning"));
+                }
+            }
+        }
+        for model in ["claude-sonnet-4-6", "claude-haiku-4-5", "gpt-5", "glm-5"] {
+            let mut req = minimal_thinking_request(model, "disabled");
+            req.max_tokens = 128000;
+            let fields = convert_request(&req).unwrap().additional_model_request_fields;
+            assert!(fields.is_none_or(|f| f.max_tokens.is_none()), "{model}");
+        }
+    }
+
+    #[test]
     fn test_output_config_does_not_emit_unsupported_additional_fields() {
         let req = minimal_request_with_output_config("claude-sonnet-4-8-thinking");
         let result = convert_request(&req).unwrap();
@@ -2715,13 +2751,13 @@ mod tests {
     }
 
     #[test]
-    fn disabled_thinking_emits_nothing_even_for_supported_model() {
+    fn disabled_thinking_preserves_output_budget_without_reasoning_fields() {
         let req = minimal_thinking_request("claude-opus-4-8", "disabled");
         let result = convert_request(&req).unwrap();
-        assert!(
-            result.additional_model_request_fields.is_none(),
-            "thinking disabled 不应下发任何字段"
-        );
+        let fields = result.additional_model_request_fields.unwrap();
+        assert_eq!(fields.max_tokens, Some(req.max_tokens));
+        assert!(fields.output_config.is_none());
+        assert!(fields.reasoning.is_none());
     }
 
     #[test]

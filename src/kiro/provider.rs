@@ -189,8 +189,7 @@ impl KiroProvider {
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
-    fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+    fn client_for_proxy(&self, effective: Option<ProxyConfig>) -> anyhow::Result<Client> {
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
             return Ok(client);
@@ -480,7 +479,9 @@ impl KiroProvider {
             let url = endpoint.mcp_url(&rctx);
             let body = endpoint.transform_mcp_body(request_body, &rctx);
 
-            let client = match self.client_for(&ctx.credentials) {
+            let effective_proxy = ctx.credentials.effective_proxy(self.global_proxy.as_ref());
+            let proxy_use = self.token_manager.prepare_proxy_use(&ctx.credentials, effective_proxy.as_ref()).await?;
+            let client = match self.client_for_proxy(proxy_use.proxy().cloned()) {
                 Ok(client) => client,
                 Err(e) => {
                     Self::emit_attempt(
@@ -552,7 +553,7 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 return Ok(McpCallResult {
-                    response: LimitedResponse::new(response, permit),
+                    response: LimitedResponse::new(response, permit).with_proxy_use(proxy_use),
                     credential_id: ctx.id,
                     endpoint: endpoint_name,
                     attempt,
@@ -864,9 +865,10 @@ impl KiroProvider {
             tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
             tracing::debug!("实际发送请求体: {}", body);
 
-            let base = self
-                .client_for(&ctx.credentials)?
-                .post(&url)
+            let effective_proxy = ctx.credentials.effective_proxy(self.global_proxy.as_ref());
+            let proxy_use = self.token_manager.prepare_proxy_use(&ctx.credentials, effective_proxy.as_ref()).await?;
+            let client = self.client_for_proxy(proxy_use.proxy().cloned())?;
+            let base = client.post(&url)
                 .body(body)
                 .header("content-type", endpoint.content_type());
             let request = endpoint.decorate_api(base, &rctx);
@@ -882,7 +884,7 @@ impl KiroProvider {
                 last_error = Some(UpstreamRateLimitError::new(Some("1".to_string())).into());
                 continue;
             };
-            let response = match self.client_for(&ctx.credentials)?.execute(request).await {
+            let response = match client.execute(request).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     drop(permit);
@@ -937,7 +939,7 @@ impl KiroProvider {
                     self.token_manager.bind_session(session, ctx.id);
                 }
                 return Ok(KiroCallResult {
-                    response: LimitedResponse::new(response, permit),
+                    response: LimitedResponse::new(response, permit).with_proxy_use(proxy_use),
                     credential_id: ctx.id,
                 });
             }

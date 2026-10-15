@@ -1,3 +1,4 @@
+import { detectTier, type Tier } from '@/lib/subscription-tier'
 import { Sparkles, Crown, Zap, Gem, Rocket, GraduationCap, Tag } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -8,7 +9,7 @@ interface SubscriptionBadgeProps {
   className?: string
 }
 
-export type Tier = 'free' | 'pro' | 'pro_plus' | 'power' | 'max' | 'student' | 'unknown'
+export { detectTier, type Tier } from '@/lib/subscription-tier'
 
 interface TierStyle {
   /** 容器背景与文字颜色 */
@@ -17,19 +18,6 @@ interface TierStyle {
   Icon: React.ComponentType<{ className?: string }>
   /** 大写标准化标题 */
   label: string
-}
-
-/** 根据订阅标题推断分级（供列表筛选复用） */
-export function detectTier(title?: string | null): Tier {
-  if (!title) return 'unknown'
-  const upper = title.toUpperCase()
-  if (upper.includes('STUDENT')) return 'student'
-  if (upper.includes('MAX')) return 'max'
-  if (upper.includes('POWER')) return 'power'
-  if (upper.includes('PRO+') || upper.includes('PRO PLUS')) return 'pro_plus'
-  if (upper.includes('PRO')) return 'pro'
-  if (upper.includes('FREE')) return 'free'
-  return 'unknown'
 }
 
 function getTierStyle(tier: Tier, original?: string | null): TierStyle {

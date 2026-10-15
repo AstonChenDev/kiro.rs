@@ -1,4 +1,5 @@
 import { CredentialTrafficControls } from "@/components/traffic-controls";
+import { CredentialStaticIp } from "@/components/credential-static-ip";
 import { useState, useEffect, useCallback, memo } from "react";
 import { toast } from "sonner";
 import {
@@ -1441,6 +1442,7 @@ function CredentialCardImpl({
                       )}
                     </LedgerRow>
                   )}
+                  {!preview && <CredentialStaticIp credential={credential} />}
                 </div>
               )}
             </div>

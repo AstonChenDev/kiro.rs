@@ -16,6 +16,8 @@ pub struct ProxyConfig {
     pub username: Option<String>,
     /// 代理认证密码
     pub password: Option<String>,
+    /// Request-scoped DNS snapshot for a proxy hostname. Never persisted.
+    pub(crate) resolved_addrs: Vec<std::net::SocketAddr>,
 }
 
 impl ProxyConfig {
@@ -25,6 +27,7 @@ impl ProxyConfig {
             url: url.into(),
             username: None,
             password: None,
+            resolved_addrs: Vec::new(),
         }
     }
 
@@ -91,7 +94,19 @@ fn client_builder(
     }
 
     if let Some(proxy_config) = proxy {
-        let mut proxy = Proxy::all(&proxy_config.url)?;
+        let mut proxy_url = proxy_config.url.clone();
+        if !proxy_config.resolved_addrs.is_empty() {
+            let mut url = reqwest::Url::parse(&proxy_url)?;
+            let host = url.host_str().ok_or_else(|| anyhow::anyhow!("代理缺少主机名"))?.to_ascii_lowercase();
+            // reqwest lowercases override keys, but non-special SOCKS URLs can
+            // retain mixed-case hosts in the connector. Normalize both sides.
+            url.set_host(Some(&host))?;
+            proxy_url = url.to_string();
+            // Preserve the hostname for HTTPS proxy TLS/SNI. The same resolver is
+            // also used by reqwest's SOCKS proxy connector, including fallback IPs.
+            builder = builder.resolve_to_addrs(&host, &proxy_config.resolved_addrs);
+        }
+        let mut proxy = Proxy::all(&proxy_url)?;
 
         // 设置代理认证
         if let (Some(username), Some(password)) = (&proxy_config.username, &proxy_config.password) {
@@ -137,4 +152,34 @@ mod tests {
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
         assert!(client.is_ok());
     }
+    #[tokio::test]
+    async fn proxy_dns_snapshot_is_used_by_http_https_and_socks_connectors() {
+        use tokio::io::AsyncReadExt;
+        for scheme in ["http", "https", "socks5", "socks5h"] {
+          for host in ["proxy-snapshot.invalid", "Proxy-Snapshot.INVALID."] {
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address=listener.local_addr().unwrap();
+            // A .invalid hostname cannot resolve via public DNS. The second
+            // address proves reqwest can retain fallback after a failed first IP.
+            let mut proxy=ProxyConfig::new(format!("{scheme}://{host}:{}",address.port()));
+            proxy.resolved_addrs=vec![std::net::SocketAddr::new("::1".parse().unwrap(),address.port()),address];
+            let client=build_client(Some(&proxy),3,TlsBackend::Rustls).unwrap();
+            let task=tokio::spawn(async move {client.get("https://203.0.113.1/").send().await});
+            let accepted=tokio::time::timeout(Duration::from_secs(4),listener.accept()).await;
+            if accepted.is_err() {
+                let result=task.await;
+                panic!("{scheme} {host}: connection did not use pinned proxy addresses: {result:?}");
+            }
+            let (mut socket,_)=accepted.unwrap().unwrap();
+            let mut buf=[0;4096];
+            let n=tokio::time::timeout(Duration::from_secs(3),socket.read(&mut buf)).await.unwrap().unwrap();
+            assert!(n>0,"{scheme}");
+            if scheme=="http" {assert!(buf[..n].starts_with(b"CONNECT "));}
+            else if scheme=="https" {assert!(buf[..n].to_ascii_lowercase().windows(b"proxy-snapshot.invalid".len()).any(|v|v==b"proxy-snapshot.invalid"),"HTTPS proxy SNI must retain hostname");}
+            else {assert_eq!(buf[0],5);}
+            task.abort();let _=task.await;
+          }
+        }
+    }
+
 }

@@ -1934,3 +1934,41 @@ fn traffic_error(error: anyhow::Error) -> Response {
         AdminServiceError::InternalError("流量策略保存失败，请检查本地存储".into()).into_http_response()
     } else { AdminServiceError::InvalidRequest(error.to_string()).into_http_response() }
 }
+
+
+pub async fn static_ips_list(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.token_manager().static_ip_list())
+}
+#[derive(serde::Deserialize)]
+#[serde(rename_all="camelCase", deny_unknown_fields)]
+pub struct StaticIpBatch { entries: Vec<crate::kiro::token_manager::static_ips::StaticIpInput> }
+#[derive(serde::Deserialize)]
+#[serde(rename_all="camelCase", deny_unknown_fields)]
+pub struct StaticIpConfig { auto_assign: Option<bool>, allowed_providers: Option<Vec<String>> }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticIpEnabled { enabled: bool }
+#[derive(serde::Deserialize)]
+#[serde(rename_all="camelCase", deny_unknown_fields)]
+pub struct StaticIpBinding { ip_id: Option<u64> }
+fn static_ip_result(result: anyhow::Result<()>) -> Response {
+    match result {
+        Ok(()) => Json(serde_json::json!({"success":true})).into_response(),
+        Err(e) => super::error::AdminServiceError::InvalidRequest(e.to_string()).into_http_response(),
+    }
+}
+pub async fn static_ips_import(State(s): State<AdminState>, Json(r): Json<StaticIpBatch>) -> Response {
+    static_ip_result(s.service.token_manager().static_ip_import(r.entries))
+}
+pub async fn static_ips_config(State(s): State<AdminState>, Json(r): Json<StaticIpConfig>) -> Response {
+    static_ip_result(s.service.token_manager().static_ip_config(r.auto_assign, r.allowed_providers))
+}
+pub async fn static_ips_delete(State(s): State<AdminState>, Path(id): Path<u64>) -> Response {
+    static_ip_result(s.service.token_manager().static_ip_delete(id))
+}
+pub async fn static_ips_enabled(State(s): State<AdminState>, Path(id): Path<u64>, Json(r): Json<StaticIpEnabled>) -> Response {
+    static_ip_result(s.service.token_manager().static_ip_enabled(id,r.enabled))
+}
+pub async fn static_ips_bind(State(s): State<AdminState>, Path(id): Path<u64>, Json(r): Json<StaticIpBinding>) -> Response {
+    static_ip_result(s.service.token_manager().static_ip_bind(id,r.ip_id))
+}

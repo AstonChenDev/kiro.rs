@@ -39,3 +39,6 @@
 /.local-test/
 /aab822_*.json
 /jac0991_*.json
+
+# Local static proxy inventory contains authentication data
+static_ips.json
