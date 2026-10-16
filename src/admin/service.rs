@@ -553,7 +553,8 @@ fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount
     let is_external_idp = auth_method.as_deref() == Some("external_idp");
 
     let provider = non_empty(cred.provider.clone());
-    // idp 与 provider 同义；缺失时按认证方式回退到合法的身份提供商
+    // idp keeps the third-party format fallback; credentials.provider explicitly
+    // names unknown identities so re-import does not mistake it for a real provider.
     let idp = provider.clone().unwrap_or_else(|| {
         if is_external_idp {
             "AzureAD"
@@ -610,7 +611,7 @@ fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount
         scopes: non_empty(cred.scopes.clone()),
         expires_at: expires_at_ms,
         auth_method,
-        provider: provider.clone(),
+        provider: Some(provider.clone().unwrap_or_else(|| "Unknown".to_string())),
     };
 
     Some(ExportedAccount {
@@ -1627,7 +1628,7 @@ impl AdminService {
         // 调用 token_manager 添加凭据
         let credential_id = self
             .token_manager
-            .add_credential(new_cred)
+            .add_credential_with_proxy_origin(new_cred, req.proxy_auto_assigned)
             .await
             .map_err(|e| self.classify_add_error(e))?;
 
@@ -4227,6 +4228,24 @@ mod tests {
     }
 
     #[test]
+    fn export_preserves_unknown_provider_without_claiming_fallback_identity() {
+        for method in [None, Some("social"), Some("idc")] {
+            let cred=KiroCredentials {refresh_token:Some("fixture".into()),auth_method:method.map(str::to_string),..Default::default()};
+            let exported=serde_json::to_value(credential_to_export_account(cred).unwrap()).unwrap();
+            assert!(exported["credentials"].as_object().unwrap().contains_key("provider"));
+            assert_eq!(exported["credentials"]["provider"],"Unknown");
+            // Preserve the format's display fallback while keeping identity unknown.
+            assert_eq!(exported["idp"],if method==Some("idc") {"BuilderId"} else {"Google"});
+        }
+        for provider in ["Github","Google","BuilderId","Enterprise"] {
+            let cred=KiroCredentials {refresh_token:Some("fixture".into()),provider:Some(provider.into()),..Default::default()};
+            let exported=serde_json::to_value(credential_to_export_account(cred).unwrap()).unwrap();
+            assert_eq!(exported["credentials"]["provider"],provider);
+            assert_eq!(exported["idp"],provider);
+        }
+    }
+
+    #[test]
     fn export_skips_api_key_credentials() {
         let mut cred = KiroCredentials::default();
         cred.kiro_api_key = Some("ksk_abc".to_string());
@@ -4574,5 +4593,103 @@ mod full_audit_cache_restart {
         eprintln!("EVIDENCE same-auth restart: persisted remaining={preserved}, identity_changed={}, visible_after_failed_refresh={visible}",old_id!=manager.balance_identity(1).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
         assert_eq!(visible,!replaced,"only unchanged authentication may recover last-known balance after restart");
+    }
+}
+
+#[cfg(test)]
+mod manual_quota_review_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    fn balance(id: u64, usage: usize) -> BalanceResponse {
+        BalanceResponse {
+            id, subscription_title: Some("KIRO POWER".into()), current_usage: usage as f64,
+            usage_limit: 100.0, remaining: 100.0 - usage as f64, usage_percentage: usage as f64,
+            next_reset_at: None, overage_enabled: Some(false), overage_capable: Some(true),
+            overage_capability_raw: None,
+        }
+    }
+
+    async fn review(initial: usize, latest: usize, disabled: bool, fail: bool) {
+        let mut config = Config::default();
+        config.traffic_policies.auto_disable_quota = false;
+        let manager = Arc::new(MultiTokenManager::new(config, vec![KiroCredentials {
+            id: Some(1), refresh_token: Some("manual-review-fixture".repeat(12)),
+            ..Default::default()
+        }], None, None, false).unwrap());
+        let service = Arc::new(AdminService::new(manager.clone(), Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let usage = Arc::new(AtomicUsize::new(initial));
+        let failing = Arc::new(AtomicBool::new(false));
+        let (count, current, failure) = (calls.clone(), usage.clone(), failing.clone());
+        *service.test_balance_fetcher.lock() = Some(Arc::new(move |id| {
+            count.fetch_add(1, Ordering::SeqCst);
+            let value = current.load(Ordering::SeqCst);
+            let fail = failure.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if fail { return Err(AdminServiceError::UpstreamError("fixture unavailable".into())); }
+                Ok(balance(id, value))
+            })
+        }));
+        service.get_balance(1).await.unwrap();
+        usage.store(latest, Ordering::SeqCst);
+        failing.store(fail, Ordering::SeqCst);
+        // Ordinary reads intentionally retain their cache semantics.
+        assert_eq!(service.get_balance(1).await.unwrap().current_usage, initial as f64);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        if disabled { manager.set_disabled(1, true).unwrap(); }
+        manager.patch_traffic_policies(serde_json::from_value(
+            serde_json::json!({"autoDisableQuota":true})
+        ).unwrap()).unwrap();
+        let state = crate::admin::AdminState {
+            admin_api_key: Arc::new(parking_lot::RwLock::new("fixture-admin".into())),
+            service: service.clone(),
+            client_keys: Arc::new(crate::admin::client_keys::ClientKeyManager::new()),
+            usage_aggregator: Arc::new(crate::admin::usage_stats::UsageAggregator::new()),
+            trace_store: Arc::new(crate::admin::trace_db::TraceStore::open_in_memory().unwrap()),
+            groups: Arc::new(crate::admin::groups::GroupManager::new()),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/credentials/1/balance/refresh", listener.local_addr().unwrap());
+        let app = crate::admin::create_admin_router(state);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let unauthorized = client.post(&url).send().await.unwrap();
+        assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let response = client.post(&url).header("x-api-key", "fixture-admin").send().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        if fail {
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+            assert_eq!(service.balance_cache.lock().get(&1).unwrap().data.current_usage, initial as f64);
+            assert_eq!(manager.snapshot().entries[0].disabled, disabled);
+        } else {
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["currentUsage"].as_f64(), Some(latest as f64));
+            assert_eq!(service.balance_cache.lock().get(&1).unwrap().data.current_usage, latest as f64);
+            assert_eq!(manager.snapshot().entries[0].disabled, disabled || latest >= 100);
+        }
+        let missing = client.post(url.replace("/1/", "/999/")).header("x-api-key", "fixture-admin").send().await.unwrap();
+        assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn manual_review_bypasses_cached_available_quota_and_disables_newly_exhausted_account() {
+        review(10, 100, false, false).await;
+    }
+    #[tokio::test]
+    async fn manual_review_does_not_disable_recovered_account_using_old_exhaustion() {
+        review(100, 10, false, false).await;
+    }
+    #[tokio::test]
+    async fn manual_review_queries_disabled_account_without_enabling_it() {
+        review(10, 20, true, false).await;
+    }
+    #[tokio::test]
+    async fn failed_manual_review_keeps_last_balance_without_reporting_cached_success_or_disabling() {
+        review(100, 10, false, true).await;
     }
 }

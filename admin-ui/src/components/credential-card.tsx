@@ -1,5 +1,6 @@
 import { CredentialTrafficControls } from "@/components/traffic-controls";
 import { CredentialStaticIp } from "@/components/credential-static-ip";
+import { useCredentialStatusChange } from "@/components/credential-batch-provider";
 import { useState, useEffect, useCallback, memo } from "react";
 import { toast } from "sonner";
 import {
@@ -410,6 +411,7 @@ function CredentialCardImpl({
   const [connectionExpanded, setConnectionExpanded] = useState(false);
 
   const setDisabled = useSetDisabled();
+  const { runSingleCredentialChange, statusChanging } = useCredentialStatusChange();
   const setPriority = useSetPriority();
   const resetFailure = useResetFailure();
   const deleteCredential = useDeleteCredential();
@@ -499,19 +501,16 @@ function CredentialCardImpl({
     onRefreshBalance(credential.id);
   }, [onRefreshBalance, credential.id]);
 
-  const handleToggleDisabled = () => {
+  const handleToggleDisabled = () => runSingleCredentialChange(async () => {
     const willEnable = credential.disabled;
-    setDisabled.mutate(
-      { id: credential.id, disabled: !credential.disabled },
-      {
-        onSuccess: (res) => {
-          toast.success(res.message);
-          if (willEnable) onRefreshBalance(credential.id);
-        },
-        onError: (err) => toast.error("操作失败: " + extractErrorMessage(err)),
-      },
-    );
-  };
+    try {
+      const res = await setDisabled.mutateAsync({ id: credential.id, disabled: !credential.disabled });
+      toast.success(res.message);
+      if (willEnable) await onRefreshBalance(credential.id);
+    } catch (err) {
+      toast.error("操作失败: " + extractErrorMessage(err));
+    }
+  });
 
   const handlePriorityChange = () => {
     const np = parseInt(priorityValue, 10);
@@ -531,11 +530,14 @@ function CredentialCardImpl({
     );
   };
 
-  const handleReset = () =>
-    resetFailure.mutate(credential.id, {
-      onSuccess: (res) => toast.success(res.message),
-      onError: (err) => toast.error("操作失败: " + extractErrorMessage(err)),
-    });
+  const handleReset = () => runSingleCredentialChange(async () => {
+    try {
+      const res = await resetFailure.mutateAsync(credential.id);
+      toast.success(res.message);
+    } catch (err) {
+      toast.error("操作失败: " + extractErrorMessage(err));
+    }
+  });
 
   const handleForceRefresh = () =>
     forceRefresh.mutate(credential.id, {
@@ -549,15 +551,15 @@ function CredentialCardImpl({
       onError: (err) => toast.error("重置失败: " + extractErrorMessage(err)),
     });
 
-  const handleDelete = () => {
-    deleteCredential.mutate(credential.id, {
-      onSuccess: (res) => {
-        toast.success(res.message);
-        setShowDeleteDialog(false);
-      },
-      onError: (err) => toast.error("删除失败: " + extractErrorMessage(err)),
-    });
-  };
+  const handleDelete = () => runSingleCredentialChange(async () => {
+    try {
+      const res = await deleteCredential.mutateAsync(credential.id);
+      toast.success(res.message);
+      setShowDeleteDialog(false);
+    } catch (err) {
+      toast.error("删除失败: " + extractErrorMessage(err));
+    }
+  });
 
   const authLabel = (() => {
     if (credential.authMethod === "api_key") return "API Key";
@@ -623,7 +625,7 @@ function CredentialCardImpl({
       onClick={runDisposition}
       disabled={
         (disposition.action === "clearThrottle" && clearThrottle.isPending) ||
-        (disposition.action === "enable" && setDisabled.isPending) ||
+        (disposition.action === "enable" && (statusChanging || setDisabled.isPending)) ||
         (disposition.action === "refreshToken" && forceRefresh.isPending)
       }
       title={`${disposition.stateLabel} → ${disposition.actionLabel}`}
@@ -734,7 +736,7 @@ function CredentialCardImpl({
             handleReset();
           }}
           disabled={
-            resetFailure.isPending ||
+            statusChanging || resetFailure.isPending ||
             (credential.failureCount === 0 &&
               credential.refreshFailureCount === 0)
           }
@@ -1092,7 +1094,7 @@ function CredentialCardImpl({
         <Switch
           checked={!credential.disabled}
           onCheckedChange={handleToggleDisabled}
-          disabled={setDisabled.isPending}
+          disabled={statusChanging || setDisabled.isPending}
           title={credential.disabled ? "启用" : "禁用"}
           className="scale-90"
         />
@@ -1158,7 +1160,7 @@ function CredentialCardImpl({
                 <Switch
                   checked={!credential.disabled}
                   onCheckedChange={handleToggleDisabled}
-                  disabled={preview || setDisabled.isPending}
+                  disabled={preview || statusChanging || setDisabled.isPending}
                   title={credential.disabled ? "点击启用" : "点击禁用"}
                   className="scale-90"
                 />
@@ -1555,7 +1557,7 @@ function CredentialCardImpl({
               <Button
                 variant="destructive"
                 onClick={handleDelete}
-                disabled={deleteCredential.isPending}
+                disabled={statusChanging || deleteCredential.isPending}
               >
                 确认删除
               </Button>

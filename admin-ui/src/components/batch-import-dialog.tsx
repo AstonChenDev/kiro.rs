@@ -47,6 +47,7 @@ interface CredentialInput {
   machineId?: string
   kiroApiKey?: string
   authMethod?: string
+  provider?: string
   endpoint?: string
   email?: string
   proxyUrl?: string
@@ -177,10 +178,12 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           saleStatus: saleStatus as CredentialSaleStatus,
         }
 
-        // 若凭据未指定代理且代理池有可用代理，随机分配一个
+        // 自动选取的共享代理标记为备用，由后端决定静态 IP 是否优先。
+        let proxyAutoAssigned = false
         if (!cred.proxyUrl?.trim() && enabledProxies.length > 0) {
           const picked = enabledProxies[Math.floor(Math.random() * enabledProxies.length)]
           cred.proxyUrl = picked.url
+          proxyAutoAssigned = true
         }
         const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
 
@@ -216,6 +219,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               endpoint: cred.endpoint?.trim() || undefined,
               email: cred.email?.trim() || undefined,
               proxyUrl: cred.proxyUrl?.trim() || undefined,
+              proxyAutoAssigned,
               proxyUsername: cred.proxyUsername?.trim() || undefined,
               proxyPassword: cred.proxyPassword?.trim() || undefined,
               metadata,
@@ -258,7 +262,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             req: {
               refreshToken: token,
               authMethod,
-              provider: isExternalIdp ? 'AzureAD' : undefined,
+              provider: isExternalIdp ? 'AzureAD' : cred.provider?.trim() || undefined,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
               clientId,
@@ -273,6 +277,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               endpoint: cred.endpoint?.trim() || undefined,
               email: cred.email?.trim() || undefined,
               proxyUrl: cred.proxyUrl?.trim() || undefined,
+              proxyAutoAssigned,
               proxyUsername: cred.proxyUsername?.trim() || undefined,
               proxyPassword: cred.proxyPassword?.trim() || undefined,
               metadata,

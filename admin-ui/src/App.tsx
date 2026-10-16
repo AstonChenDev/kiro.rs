@@ -13,6 +13,7 @@ import { ConfirmProvider } from "@/components/ui/confirm-dialog";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { tabFromHash } from "@/hooks/use-url-state";
 import { AppLayout, type TabKey as Tab } from "@/components/layout/app-layout";
+import { CredentialBatchProvider } from "@/components/credential-batch-provider";
 
 const Dashboard = lazy(() =>
   import("@/components/dashboard").then((m) => ({ default: m.Dashboard })),
@@ -187,7 +188,9 @@ function LoggedInApp({
           onSelectMode={onSelectMode}
           onLogout={onLogout}
         >
-          <AppMain tab={tab} onLogout={onLogout} />
+          <CredentialBatchProvider>
+            <AppMain tab={tab} onLogout={onLogout} />
+          </CredentialBatchProvider>
         </AppLayout>
         <Toaster position="top-center" />
       </ConfirmProvider>

@@ -53,8 +53,22 @@ pub struct TrafficPolicies {
 }
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct LimitPatch {
+    #[serde(deserialize_with = "present_limit")]
+    pub concurrency: Option<Option<u32>>,
+    #[serde(deserialize_with = "present_limit")]
+    pub rpm: Option<Option<u32>>,
+}
+
+// Missing means unchanged; explicit null restores inheritance; zero is unlimited.
+fn present_limit<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Option<u32>>, D::Error> {
+    Option::<u32>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct TrafficPolicyPatch {
-    pub tiers: BTreeMap<AccountTier, Limits>,
+    pub tiers: BTreeMap<AccountTier, LimitPatch>,
     pub default_concurrency: Option<u32>,
     pub auto_disable_quota: Option<bool>,
     pub disable_at_base_quota: Option<bool>,
@@ -140,6 +154,17 @@ impl LimitedResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn limit_patch_preserves_omission_null_and_zero() {
+        let empty: LimitPatch = serde_json::from_str("{}").unwrap();
+        assert!(empty.concurrency.is_none() && empty.rpm.is_none());
+        let patch: LimitPatch = serde_json::from_str(r#"{"concurrency":null,"rpm":0}"#).unwrap();
+        assert_eq!(patch.concurrency, Some(None));
+        assert_eq!(patch.rpm, Some(Some(0)));
+        for invalid in [r#"{"rpm":-1}"#, r#"{"rpm":1.5}"#, r#"{"rpm":"20"}"#, r#"{"other":5}"#] {
+            assert!(serde_json::from_str::<LimitPatch>(invalid).is_err());
+        }
+    }
     #[test]
     fn inheritance_is_dynamic_and_independent() {
         let mut p = TrafficPolicies::default();

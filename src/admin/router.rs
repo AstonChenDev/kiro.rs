@@ -59,6 +59,7 @@ const MAX_ADMIN_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// - `POST /credentials/:id/reset` - 重置失败计数
 /// - `POST /credentials/:id/refresh` - 强制刷新 Token
 /// - `GET /credentials/:id/balance` - 获取凭据余额
+/// - `POST /credentials/:id/balance/refresh` - 强制复查指定凭据的最新额度
 /// - `GET /config/load-balancing` - 获取负载均衡模式
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
 ///
@@ -104,6 +105,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/refresh-token", put(update_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
+        .route("/credentials/{id}/balance/refresh", post(super::handlers::refresh_credential_balance))
         .route("/credentials/{id}/models", get(get_credential_models))
         .route("/models", get(get_current_models))
         .route("/models/test", post(test_model))

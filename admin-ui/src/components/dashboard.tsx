@@ -1,4 +1,6 @@
 import { TrafficProvider, TrafficPoliciesPanel, useTrafficState } from "@/components/traffic-controls";
+import { deleteCredentialsWithVerification } from "@/lib/credential-delete-result";
+import { useCredentialBatchState } from "@/components/credential-batch-provider";
 import { useState, useEffect, useRef, useDeferredValue, useCallback, useMemo } from "react";
 import { isAxiosError } from "axios";
 import {
@@ -133,6 +135,7 @@ import {
 } from "@dnd-kit/sortable";
 import {
   getCredentialBalance,
+  refreshCredentialBalance,
   forceRefreshToken,
   disableQuotaExceeded,
   enableOverageForAllCapable,
@@ -289,7 +292,18 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
   const [newAdminKey, setNewAdminKey] = useState("");
   const [updatingAdminKey, setUpdatingAdminKey] = useState(false);
   const [showAdminKeyPlain, setShowAdminKeyPlain] = useState(false);
-  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const {
+    selectedIds, setSelectedIds, singleChanging, getSnapshot,
+    batchDeleting, setBatchDeleting, batchDeleteLock,
+    batchDisableLock, batchRestoreLock,
+    batchRestoring, setBatchRestoring, batchDisabling, setBatchDisabling,
+    batchEnabling, setBatchEnabling,
+    batchQuotaReviewing, setBatchQuotaReviewing, quotaProgress, setQuotaProgress,
+    quotaErrors, setQuotaErrors, quotaSummary, setQuotaSummary,
+    enableProgress, setEnableProgress, enableErrors, setEnableErrors,
+    disableProgress, setDisableProgress, disableErrors, setDisableErrors,
+    deleteErrors, setDeleteErrors, deleteProgress, setDeleteProgress,
+  } = useCredentialBatchState();
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false);
   const [verifying, setVerifying] = useState(false);
   const [verifyDeleting, setVerifyDeleting] = useState(false);
@@ -300,19 +314,6 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(
     new Map(),
   );
-  const [batchDeleting, setBatchDeleting] = useState(false);
-  const batchDeleteLock = useRef(false);
-  const batchDisableLock = useRef(false);
-  const batchRestoreLock = useRef(false);
-  const [batchRestoring, setBatchRestoring] = useState(false);
-  const [batchDisabling, setBatchDisabling] = useState(false);
-  const [disableProgress, setDisableProgress] = useState({ current: 0, total: 0 });
-  const [disableErrors, setDisableErrors] = useState<{ id: number; message: string }[]>([]);
-  const [deleteErrors, setDeleteErrors] = useState<{ id: number; message: string }[]>([]);
-  const [deleteProgress, setDeleteProgress] = useState({
-    current: 0,
-    total: 0,
-  });
   const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(
     new Map(),
   );
@@ -358,7 +359,7 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
   const { data, isLoading, error, refetch } = useCredentials();
   const { rows: trafficRows } = useTrafficState();
   const { mutate: deleteCredential } = useDeleteCredential();
-  const { mutate: resetFailure } = useResetFailure();
+  const { mutateAsync: resetFailure } = useResetFailure();
   const { data: loadBalancingData, isLoading: isLoadingMode } =
     useLoadBalancingMode();
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } =
@@ -796,6 +797,123 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
     }
   };
 
+  const handleBatchQuotaReview = async () => {
+    if (batchDisableLock.current || batchRestoreLock.current || batchDeleteLock.current || selectedIds.size === 0) return;
+    const ids = Array.from(selectedIds);
+    batchDisableLock.current = true;
+    setBatchQuotaReviewing(true);
+    setQuotaErrors([]);
+    setQuotaSummary("");
+    setQuotaProgress({ current: 0, total: ids.length });
+    const failures = new Map<number, string>();
+    let next = 0;
+    let completed = 0;
+    try {
+      const worker = async () => {
+        while (next < ids.length) {
+          const id = ids[next++];
+          try {
+            // Query only. Disabled accounts remain disabled; the server applies
+            // the existing automatic quota-disable policy to the returned balance.
+            const balance = await refreshCredentialBalance(id);
+            setBalanceMap(current => new Map(current).set(id, balance));
+          } catch (error) {
+            failures.set(id, extractErrorMessage(error));
+          } finally {
+            completed++;
+            setQuotaProgress({ current: completed, total: ids.length });
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(3, ids.length) }, () => worker()));
+      setQuotaErrors(ids.filter(id => failures.has(id)).map(id => ({ id, message: failures.get(id)! })));
+      await Promise.all(["credentials", "credential-traffic", "static-ips", "proxy-pool", "stats"].map(key =>
+        queryClient.invalidateQueries({ queryKey: [key] }),
+      ));
+      const summary = `额度复查完成：成功 ${ids.length - failures.size} 个，失败 ${failures.size} 个`;
+      setQuotaSummary(summary);
+      if (failures.size) toast.warning(`${summary}；请查看失败原因后重试`);
+      else toast.success(summary);
+    } finally {
+      batchDisableLock.current = false;
+      setBatchQuotaReviewing(false);
+    }
+  };
+
+  const handleBatchEnable = async () => {
+    if (batchDisableLock.current || batchRestoreLock.current || batchDeleteLock.current || selectedIds.size === 0) return;
+    const ids = Array.from(selectedIds);
+    batchDisableLock.current = true;
+    setBatchEnabling(true);
+    setEnableErrors([]);
+    setEnableProgress({ current: 0, total: ids.length });
+    try {
+      // Enable only: quota queries belong to the separate review action.
+      let latest: Awaited<ReturnType<typeof getCredentials>>;
+      try {
+        latest = await getCredentials();
+      } catch (error) {
+        toast.error(`未执行批量启用：读取凭据状态失败，${extractErrorMessage(error)}`);
+        return;
+      }
+      const accounts = new Map(latest.credentials.map(c => [c.id, c]));
+      const completed = new Set<number>();
+      const failures: { id: number; message: string }[] = [];
+      const uncertain: { id: number; message: string }[] = [];
+      let skipped = 0;
+      let unconfirmed = 0;
+      for (const [index, id] of ids.entries()) {
+        try {
+          const account = accounts.get(id);
+          if (!account) throw new Error("凭据已不存在，请刷新列表");
+          if (!account.disabled) skipped++;
+          else await setCredentialDisabled(id, false);
+          completed.add(id);
+        } catch (error) {
+          const status = isAxiosError(error) ? error.response?.status : undefined;
+          const rejected = status && status >= 400 && status < 500 && status !== 408;
+          const item = { id, message: extractErrorMessage(error) };
+          if (!accounts.has(id) || rejected) failures.push(item);
+          else uncertain.push(item);
+        }
+        setEnableProgress({ current: index + 1, total: ids.length });
+      }
+      if (uncertain.length > 0) {
+        try {
+          // Read directly after the writes; cached data cannot settle a lost response.
+          const verified = new Map((await getCredentials()).credentials.map(c => [c.id, c]));
+          for (const item of uncertain) {
+            const account = verified.get(item.id);
+            if (account && !account.disabled) completed.add(item.id);
+            else failures.push({ id: item.id, message: account
+              ? `已核实该账号当前仍禁用：${item.message}`
+              : "凭据已不存在，请刷新列表" });
+          }
+        } catch {
+          unconfirmed = uncertain.length;
+          failures.push(...uncertain.map(item => ({ id: item.id,
+            message: `结果未确认，请恢复连接后核对启用状态：${item.message}` })));
+        }
+      }
+      setEnableErrors(failures);
+      setSelectedIds(current => {
+        const next = new Set(current);
+        completed.forEach(id => next.delete(id));
+        failures.forEach(({ id }) => next.add(id));
+        return next;
+      });
+      await Promise.all(["credentials", "credential-traffic", "static-ips", "proxy-pool", "stats"].map(key =>
+        queryClient.invalidateQueries({ queryKey: [key] }),
+      ));
+      const summary = `已启用 ${completed.size - skipped} 个，已启用跳过 ${skipped} 个`;
+      if (failures.length) toast.warning(`${summary}，${failures.length - unconfirmed} 个未完成${unconfirmed ? `，${unconfirmed} 个结果未确认` : ""}；已保留选中，请核对状态及原因后重试`);
+      else toast.success(summary);
+    } finally {
+      batchDisableLock.current = false;
+      setBatchEnabling(false);
+    }
+  };
+
   const handleBatchDisable = async () => {
     if (batchDisableLock.current || batchRestoreLock.current || batchDeleteLock.current || selectedIds.size === 0) return;
     const ids = Array.from(selectedIds);
@@ -871,7 +989,7 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
   };
 
   const handleBatchDelete = async () => {
-    if (batchDeleteLock.current || batchDisableLock.current) return;
+    if (batchDeleteLock.current || batchDisableLock.current || batchRestoreLock.current) return;
     if (selectedIds.size === 0) {
       toast.error("请先选择要删除的凭据");
       return;
@@ -889,19 +1007,10 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
       setBatchDeleting(true);
       setDeleteErrors([]);
       setDeleteProgress({ current: 0, total: ids.length });
-      const succeeded = new Set<number>();
-      const failures: { id: number; message: string }[] = [];
-      for (let i = 0; i < ids.length; i++) {
-        const id = ids[i];
-        try {
-          // 直接等待请求，避免依赖会随组件卸载或其他删除操作失效的 mutate 回调。
-          await deleteCredentialRequest(id);
-          succeeded.add(id);
-        } catch (error) {
-          failures.push({ id, message: extractErrorMessage(error) });
-        }
-        setDeleteProgress({ current: i + 1, total: ids.length });
-      }
+      const { succeeded, failures, unconfirmed } = await deleteCredentialsWithVerification(ids, {
+        remove: deleteCredentialRequest, read: getCredentials,
+        progress: setDeleteProgress, errorMessage: extractErrorMessage,
+      });
       setDeleteErrors(failures);
       setSelectedIds((current) => {
         const next = new Set(current);
@@ -909,13 +1018,12 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
         failures.forEach(({ id }) => next.add(id));
         return next;
       });
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["credentials"] }),
-        queryClient.invalidateQueries({ queryKey: ["credential-traffic"] }),
-        queryClient.invalidateQueries({ queryKey: ["stats"] }),
-      ]);
-      if (failures.length === 0) toast.success(`成功删除 ${succeeded.size} 个凭据`);
-      else toast.warning(`成功删除 ${succeeded.size} 个，失败 ${failures.length} 个；失败项已保留选中，请查看错误详情后重试`);
+      await Promise.all(["credentials", "credential-traffic", "static-ips", "proxy-pool", "stats"].map(key =>
+        queryClient.invalidateQueries({ queryKey: [key] }),
+      ));
+      const summary = `已完成删除 ${succeeded.size} 个凭据`;
+      if (failures.length === 0) toast.success(summary);
+      else toast.warning(`${summary}，${failures.length - unconfirmed} 个未完成${unconfirmed ? `，${unconfirmed} 个结果未确认` : ""}；已保留选中，请核对状态及原因后重试`);
     } finally {
       setBatchDeleting(false);
       batchDeleteLock.current = false;
@@ -923,7 +1031,7 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
   };
 
   const handleBatchResetFailure = async () => {
-    if (batchDisableLock.current || batchRestoreLock.current) return;
+    if (batchDisableLock.current || batchRestoreLock.current || batchDeleteLock.current) return;
     if (selectedIds.size === 0) {
       toast.error("请先选择要恢复的凭据");
       return;
@@ -943,19 +1051,10 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
         f = 0;
       for (const id of failedIds) {
         try {
-          await new Promise<void>((resolve, reject) => {
-            resetFailure(id, {
-              onSuccess: () => {
-                s++;
-                resolve();
-              },
-              onError: (err) => {
-                f++;
-                reject(err);
-              },
-            });
-          });
-        } catch {}
+          // mutateAsync settles even when the Dashboard observer unmounts.
+          await resetFailure(id);
+          s++;
+        } catch { f++; }
       }
       if (f === 0) toast.success(`成功恢复 ${s} 个凭据`);
       else toast.warning(`成功 ${s} 个，失败 ${f} 个`);
@@ -1000,45 +1099,62 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
   };
 
   const handleClearAll = async () => {
-    if (!data?.credentials || data.credentials.length === 0) {
-      toast.error("没有可清除的凭据");
-      return;
-    }
-    const disabled = data.credentials.filter((c) => c.disabled);
-    if (disabled.length === 0) {
+    if (batchDeleteLock.current || batchDisableLock.current || batchRestoreLock.current) return;
+    const ids = (data?.credentials ?? []).filter(c => c.disabled).map(c => c.id);
+    const previousErrors = getSnapshot().deleteErrors;
+    if (ids.length === 0 && previousErrors.length === 0) {
       toast.error("没有可清除的已禁用凭据");
       return;
     }
-    if (
-      !(await confirm({
+    // Hold the app-owned lock through confirmation, fresh read, and deletion.
+    batchDeleteLock.current = true;
+    setBatchDeleting(true);
+    setDeleteProgress({ current: 0, total: ids.length });
+    try {
+      if (ids.length > 0 && !(await confirm({
         title: "清除已禁用凭据",
-        description: `确定要清除所有 ${disabled.length} 个已禁用凭据吗？此操作无法撤销。`,
+        description: `确定要清除这 ${ids.length} 个已禁用凭据吗？确认后会重新核对状态，已启用的凭据会跳过。此操作无法撤销。`,
         confirmText: "清除",
         destructive: true,
-      }))
-    )
-      return;
-    let s = 0,
-      f = 0;
-    for (const c of disabled) {
+      }))) return;
+      let latest: Awaited<ReturnType<typeof getCredentials>>;
       try {
-        await new Promise<void>((resolve, reject) => {
-          deleteCredential(c.id, {
-            onSuccess: () => {
-              s++;
-              resolve();
-            },
-            onError: (err) => {
-              f++;
-              reject(err);
-            },
-          });
-        });
-      } catch {}
+        latest = await getCredentials();
+      } catch (error) {
+        toast.error(`未执行清除：读取凭据状态失败，${extractErrorMessage(error)}`);
+        return;
+      }
+      const accounts = new Map(latest.credentials.map(c => [c.id, c]));
+      // Never expand a confirmed deletion to accounts newly disabled meanwhile.
+      const targets = ids.filter(id => accounts.get(id)?.disabled);
+      const skipped = ids.length - targets.length;
+      // Previous failures may already be gone, even when no disabled cards remain.
+      // Reconcile them without adding them to the confirmed deletion targets.
+      const absent = new Set([...ids, ...previousErrors.map(e => e.id)].filter(id => !accounts.has(id)));
+      setDeleteProgress({ current: 0, total: targets.length });
+      const { succeeded, failures, unconfirmed } = await deleteCredentialsWithVerification(targets, {
+        remove: deleteCredentialRequest, read: getCredentials,
+        progress: setDeleteProgress, errorMessage: extractErrorMessage,
+      });
+      absent.forEach(id => succeeded.add(id));
+      const preserved = previousErrors.filter(e => !ids.includes(e.id) && !succeeded.has(e.id));
+      setDeleteErrors([...preserved, ...failures]);
+      setSelectedIds(current => {
+        const next = new Set(current);
+        succeeded.forEach(id => next.delete(id));
+        failures.forEach(({ id }) => next.add(id));
+        return next;
+      });
+      await Promise.all(["credentials", "credential-traffic", "static-ips", "proxy-pool", "stats"].map(key =>
+        queryClient.invalidateQueries({ queryKey: [key] }),
+      ));
+      const summary = `已完成清除或核实不存在 ${succeeded.size} 个凭据，跳过 ${skipped} 个状态已变化或已不存在的凭据`;
+      if (failures.length) toast.warning(`${summary}，${failures.length - unconfirmed} 个未完成${unconfirmed ? `，${unconfirmed} 个结果未确认` : ""}；已保留选中，请核对状态及原因后重试`);
+      else toast.success(summary);
+    } finally {
+      batchDeleteLock.current = false;
+      setBatchDeleting(false);
     }
-    if (f === 0) toast.success(`成功清除所有 ${s} 个已禁用凭据`);
-    else toast.warning(`清除已禁用凭据：成功 ${s} 个，失败 ${f} 个`);
-    deselectAll();
   };
 
   const handleQueryCurrentPageInfo = async () => {
@@ -1250,36 +1366,42 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
   };
 
   // 一键超额：把所有已超额（未禁用）凭据标记为 QuotaExceeded 并禁用
-  const [disablingQuota, setDisablingQuota] = useState(false);
   const handleDisableQuotaExceeded = async () => {
+    if (batchDisableLock.current || batchDeleteLock.current || batchRestoreLock.current) return;
     if (quotaExceededCount === 0) {
       toast.info('当前没有已超额的凭据，可先点击"刷新当前页余额"');
       return;
     }
-    if (
-      !(await confirm({
+    batchDisableLock.current = true;
+    setBatchDisabling(true);
+    setDisableProgress({ current: 0, total: quotaExceededCount });
+    try {
+      if (!(await confirm({
         title: "禁用已超额凭据",
         description: `确定要把 ${quotaExceededCount} 个已超额的凭据全部禁用吗？`,
         confirmText: "禁用",
         destructive: true,
-      }))
-    )
-      return;
-    setDisablingQuota(true);
-    try {
-      const res = await disableQuotaExceeded();
-      const ok = res.disabledIds?.length || 0;
-      const skip = res.skippedIds?.length || 0;
-      if (ok > 0)
-        toast.success(
-          `已禁用 ${ok} 个已超额凭据${skip > 0 ? `，跳过 ${skip} 个` : ""}`,
-        );
-      else toast.warning("未找到已超额凭据（缓存可能已失效）");
-      queryClient.invalidateQueries({ queryKey: ["credentials"] });
-    } catch (err) {
-      toast.error("一键超额失败: " + extractErrorMessage(err));
+      }))) return;
+      try {
+        const res = await disableQuotaExceeded();
+        const ok = res.disabledIds?.length || 0;
+        const skip = res.skippedIds?.length || 0;
+        if (ok > 0)
+          toast.success(
+            `已禁用 ${ok} 个已超额凭据${skip > 0 ? `，跳过 ${skip} 个` : ""}`,
+          );
+        else toast.warning("未找到已超额凭据（缓存可能已失效）");
+      } catch (err) {
+        toast.error("一键超额失败: " + extractErrorMessage(err));
+      } finally {
+        // A lost response may still have changed state and released static IPs.
+        await Promise.all(["credentials", "credential-traffic", "static-ips", "proxy-pool", "stats"].map(key =>
+          queryClient.invalidateQueries({ queryKey: [key] }),
+        ));
+      }
     } finally {
-      setDisablingQuota(false);
+      batchDisableLock.current = false;
+      setBatchDisabling(false);
     }
   };
 
@@ -1637,6 +1759,27 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
 
         <TrafficPoliciesPanel />
 
+        {(batchQuotaReviewing || quotaSummary) && <p role="status" className="mb-3 text-sm">
+          {batchQuotaReviewing ? `额度复查中 ${quotaProgress.current}/${quotaProgress.total}` : quotaSummary}
+        </p>}
+        {quotaErrors.length > 0 && (
+          <div role="alert" data-no-rect-select className="mb-4 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm">
+            <p className="font-medium text-destructive">{quotaErrors.length} 个账号额度复查失败</p>
+            <ul className="mt-2 max-h-40 space-y-1 overflow-y-auto text-xs">
+              {quotaErrors.map(({ id, message }) => <li key={id}>凭据 #{id}：{message}</li>)}
+            </ul>
+          </div>
+        )}
+
+        {enableErrors.length > 0 && (
+          <div role="alert" data-no-rect-select className="mb-4 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm">
+            <p className="font-medium text-destructive">{enableErrors.length} 个凭据的启用结果需要核对，已保留选中</p>
+            <ul className="mt-2 max-h-40 space-y-1 overflow-y-auto text-xs">
+              {enableErrors.map(({ id, message }) => <li key={id}>凭据 #{id}：{message}</li>)}
+            </ul>
+          </div>
+        )}
+
         {disableErrors.length > 0 && (
           <div role="alert" data-no-rect-select className="mb-4 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm">
             <p className="font-medium text-destructive">{disableErrors.length} 个凭据的禁用结果需要核对，已保留选中</p>
@@ -1943,7 +2086,25 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
 
               {selectedIds.size > 0 && (
                 <Button size="sm" variant="outline" className="w-full sm:w-auto"
-                  onClick={handleBatchDisable} disabled={batchDisabling || batchRestoring || batchDeleting || verifying || batchRefreshing || verifyDeleting}>
+                  onClick={handleBatchEnable} disabled={batchQuotaReviewing || singleChanging || batchEnabling || batchDisabling || batchRestoring || batchDeleting || verifying || batchRefreshing || verifyDeleting}
+                  title="仅启用所选账号，不复查额度；需要静态 IP 的账号无空闲 IP 时仍需等待">
+                  {batchEnabling ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
+                  {batchEnabling ? `启用中 ${enableProgress.current}/${enableProgress.total}` : `启用选中 (${selectedIds.size})`}
+                </Button>
+              )}
+
+              {selectedIds.size > 0 && (
+                <Button size="sm" variant="outline" className="w-full sm:w-auto"
+                  onClick={handleBatchQuotaReview} disabled={batchQuotaReviewing || singleChanging || batchEnabling || batchDisabling || batchRestoring || batchDeleting || verifying || batchRefreshing || verifyDeleting}
+                  title="仅复查所选账号的额度，不启用账号；按当前超额自动禁用策略处理">
+                  {batchQuotaReviewing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                  {batchQuotaReviewing ? `额度复查 ${quotaProgress.current}/${quotaProgress.total}` : `额度复查 (${selectedIds.size})`}
+                </Button>
+              )}
+
+              {selectedIds.size > 0 && (
+                <Button size="sm" variant="outline" className="w-full sm:w-auto"
+                  onClick={handleBatchDisable} disabled={batchQuotaReviewing || singleChanging || batchEnabling || batchDisabling || batchRestoring || batchDeleting || verifying || batchRefreshing || verifyDeleting}>
                   {batchDisabling ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Ban className="h-3.5 w-3.5" />}
                   {batchDisabling ? `禁用中 ${disableProgress.current}/${disableProgress.total}` : `禁用选中 (${selectedIds.size})`}
                 </Button>
@@ -1955,7 +2116,7 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
                   variant="destructive"
                   className="w-full sm:w-auto"
                   onClick={handleBatchDelete}
-                  disabled={batchDeleting || batchDisabling}
+                  disabled={batchQuotaReviewing || singleChanging || batchDeleting || batchDisabling || batchEnabling || batchRestoring}
                 >
                   {batchDeleting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
                   {batchDeleting ? `删除中 ${deleteProgress.current}/${deleteProgress.total}` : `删除选中 (${selectedIds.size})`}
@@ -2130,7 +2291,7 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
                   <DropdownMenuSeparator />
                   <DropdownMenuItem
                     destructive
-                    disabled={disablingQuota || quotaExceededCount === 0}
+                    disabled={batchQuotaReviewing || singleChanging || batchEnabling || batchDisabling || batchRestoring || batchDeleting || quotaExceededCount === 0}
                     onSelect={(e) => {
                       e.preventDefault();
                       handleDisableQuotaExceeded();
@@ -2141,14 +2302,14 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
                   </DropdownMenuItem>
                   <DropdownMenuItem
                     destructive
-                    disabled={batchDeleting || disabledCredentialCount === 0}
+                    disabled={batchQuotaReviewing || singleChanging || batchEnabling || batchDisabling || batchRestoring || batchDeleting || (disabledCredentialCount === 0 && deleteErrors.length === 0)}
                     onSelect={(e) => {
                       e.preventDefault();
                       handleClearAll();
                     }}
                   >
                     <Trash2 />
-                    清除已禁用 ({disabledCredentialCount})
+                    {disabledCredentialCount === 0 && deleteErrors.length > 0 ? "核对删除结果" : `清除已禁用 (${disabledCredentialCount})`}
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -2339,8 +2500,22 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
               onClear={deselectAll}
               noun="个凭据"
             >
+              <Button onClick={handleBatchEnable} size="sm" variant="ghost"
+                disabled={batchQuotaReviewing || singleChanging || batchEnabling || batchDisabling || batchRestoring || batchDeleting || verifying || batchRefreshing || verifyDeleting}
+                className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent"
+                title="仅启用所选账号，不复查额度；需要静态 IP 的账号无空闲 IP 时仍需等待">
+                {batchEnabling ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
+                {batchEnabling ? `启用中 ${enableProgress.current}/${enableProgress.total}` : "启用选中"}
+              </Button>
+              <Button onClick={handleBatchQuotaReview} size="sm" variant="ghost"
+                disabled={batchQuotaReviewing || singleChanging || batchEnabling || batchDisabling || batchRestoring || batchDeleting || verifying || batchRefreshing || verifyDeleting}
+                className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent"
+                title="仅复查所选账号的额度，不启用账号；按当前超额自动禁用策略处理">
+                {batchQuotaReviewing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                {batchQuotaReviewing ? `额度复查 ${quotaProgress.current}/${quotaProgress.total}` : "额度复查"}
+              </Button>
               <Button onClick={handleBatchDisable} size="sm" variant="ghost"
-                disabled={batchDisabling || batchRestoring || batchDeleting || verifying || batchRefreshing || verifyDeleting}
+                disabled={batchQuotaReviewing || singleChanging || batchEnabling || batchDisabling || batchRestoring || batchDeleting || verifying || batchRefreshing || verifyDeleting}
                 className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent"
                 title="禁用所有选中凭据，包含其他分页的选择">
                 {batchDisabling ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Ban className="h-3.5 w-3.5" />}
@@ -2348,7 +2523,7 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
               </Button>
               <Button
                 onClick={() => setBatchEditDialogOpen(true)}
-                disabled={batchDisabling}
+                disabled={batchQuotaReviewing || singleChanging || batchEnabling || batchDisabling}
                 size="sm"
                 variant="ghost"
                 className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent"
@@ -2362,7 +2537,7 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
                 size="sm"
                 variant="ghost"
                 className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent"
-                disabled={verifying || batchDisabling}
+                disabled={batchQuotaReviewing || singleChanging || verifying || batchDisabling || batchEnabling}
               >
                 <CheckCircle2
                   className={`h-3.5 w-3.5 ${verifying ? "animate-spin" : ""}`}
@@ -2376,7 +2551,7 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
                 size="sm"
                 variant="ghost"
                 className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent"
-                disabled={batchRefreshing || batchDisabling}
+                disabled={batchQuotaReviewing || singleChanging || batchRefreshing || batchDisabling || batchEnabling}
               >
                 <RefreshCw
                   className={`h-3.5 w-3.5 ${batchRefreshing ? "animate-spin" : ""}`}
@@ -2387,7 +2562,7 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
               </Button>
               <Button
                 onClick={handleBatchResetFailure}
-                disabled={batchDisabling || batchRestoring}
+                disabled={batchQuotaReviewing || singleChanging || batchEnabling || batchDisabling || batchRestoring}
                 size="sm"
                 variant="ghost"
                 className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent"
@@ -2400,7 +2575,7 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
                 onClick={handleBatchDelete}
                 size="sm"
                 variant="ghost"
-                disabled={batchDeleting || batchDisabling}
+                disabled={batchQuotaReviewing || singleChanging || batchDeleting || batchDisabling || batchEnabling || batchRestoring}
                 className="h-7 px-2.5 text-xs gap-1 rounded text-destructive hover:bg-destructive/10 hover:text-destructive"
               >
                 {batchDeleting ? (

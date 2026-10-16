@@ -13,6 +13,9 @@ export interface Policies {
   autoDisableQuota: boolean
   disableAtBaseQuota: boolean
 }
+export interface PolicyPatch extends Partial<Omit<Policies, 'tiers'>> {
+  tiers?: Partial<Record<AccountTier, Partial<Limits>>>
+}
 export interface TrafficStatus {
   id: number
   settings: CredentialTraffic
@@ -26,7 +29,7 @@ export interface RefreshJob {
   errors: Record<string, string>; finishedAt: string | null
 }
 export const getPolicies = async () => (await api.get<Policies>('/config/traffic-policies')).data
-export const savePolicies = async (policy: Partial<Policies>) => (await api.patch<Policies>('/config/traffic-policies', policy)).data
+export const savePolicies = async (policy: PolicyPatch) => (await api.patch<Policies>('/config/traffic-policies', policy)).data
 export const getTraffic = async () => (await api.get<TrafficStatus[]>('/credentials/traffic')).data
 export const saveCredentialTraffic = async (id: number, settings: CredentialTraffic) =>
   (await api.put(`/credentials/${id}/traffic`, settings)).data

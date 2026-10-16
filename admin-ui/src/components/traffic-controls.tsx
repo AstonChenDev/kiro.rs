@@ -7,7 +7,7 @@ import { Switch } from '@/components/ui/switch'
 import {
   TIERS, TIER_NAMES, getPolicies, savePolicies, getTraffic, saveCredentialTraffic,
   startBalanceRefresh, getBalanceRefresh, restoreCredentialTrafficLimits,
-  type Policies, type CredentialTraffic, type TrafficStatus, type AccountTier, type RefreshJob,
+  type Policies, type PolicyPatch, type Limits, type CredentialTraffic, type TrafficStatus, type AccountTier, type RefreshJob,
 } from '@/api/traffic'
 import { extractErrorMessage } from '@/lib/utils'
 import { BALANCE_REFRESH_KEY, createBalanceRefreshController } from '@/lib/balance-refresh'
@@ -108,9 +108,14 @@ export function TrafficPoliciesPanel() {
         <p className="text-xs text-muted-foreground">关闭自动禁用不会恢复已禁用账号。开启后，以最新有效额度或上游明确的额度耗尽结果判断。</p>
         <Button size="sm" disabled={!dirty || save.isPending} onClick={() => {
           if (!valid(draft.defaultConcurrency) || Object.values(draft.tiers).some(l => l && (!valid(l.concurrency) || !valid(l.rpm)))) return toast.error('请输入 0～100000 的整数')
-          const patch: Partial<Policies> = { tiers: {} }
+          const patch: PolicyPatch = { tiers: {} }
           for (const tier of TIERS) {
-            if (JSON.stringify(draft.tiers[tier]) !== JSON.stringify(original?.tiers[tier])) patch.tiers![tier] = draft.tiers[tier]
+            const limits: Partial<Limits> = {}
+            for (const field of ['concurrency', 'rpm'] as const) {
+              const value = draft.tiers[tier]?.[field] ?? null
+              if (value !== (original?.tiers[tier]?.[field] ?? null)) limits[field] = value
+            }
+            if (Object.keys(limits).length) patch.tiers![tier] = limits
           }
           if (draft.defaultConcurrency !== original?.defaultConcurrency) patch.defaultConcurrency = draft.defaultConcurrency
           if (draft.autoDisableQuota !== original?.autoDisableQuota) patch.autoDisableQuota = draft.autoDisableQuota

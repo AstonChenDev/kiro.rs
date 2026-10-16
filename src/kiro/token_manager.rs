@@ -2230,11 +2230,16 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    /// Merge only explicitly edited types so unrelated concurrent edits are preserved.
+    /// Merge explicitly edited fields atomically so concurrent edits are preserved.
     pub fn patch_traffic_policies(&self, patch: super::traffic::TrafficPolicyPatch) -> anyhow::Result<TrafficPolicies> {
         let _guard = self.runtime_config_update_lock.lock();
         let mut policies = self.traffic_policies();
-        policies.tiers.extend(patch.tiers);
+        for (tier, patch) in patch.tiers {
+            if patch.concurrency.is_none() && patch.rpm.is_none() { continue; }
+            let limits = policies.tiers.entry(tier).or_default();
+            if let Some(value) = patch.concurrency { limits.concurrency = value; }
+            if let Some(value) = patch.rpm { limits.rpm = value; }
+        }
         if let Some(value) = patch.default_concurrency { policies.default_concurrency = value; }
         if let Some(value) = patch.auto_disable_quota { policies.auto_disable_quota = value; }
         if let Some(value) = patch.disable_at_base_quota { policies.disable_at_base_quota = value; }
@@ -4366,7 +4371,11 @@ impl MultiTokenManager {
     /// # 返回
     /// - `Ok(u64)` - 新凭据 ID
     /// - `Err(_)` - 验证失败或添加失败
-    pub async fn add_credential(self: &Arc<Self>, mut new_cred: KiroCredentials) -> anyhow::Result<u64> {
+    pub async fn add_credential(self: &Arc<Self>, new_cred: KiroCredentials) -> anyhow::Result<u64> {
+        self.add_credential_with_proxy_origin(new_cred, false).await
+    }
+
+    pub(crate) async fn add_credential_with_proxy_origin(self: &Arc<Self>, mut new_cred: KiroCredentials, proxy_auto_assigned: bool) -> anyhow::Result<u64> {
         // 1. 基本验证
         new_cred.traffic.validate()?;
         if new_cred.is_api_key_credential() {
@@ -4428,7 +4437,7 @@ impl MultiTokenManager {
 
         // Pin the chosen proxy before validation, including ordinary/shared proxies.
         // Drop releases the import guard on success, failure or cancellation.
-        let static_reservation = self.prepare_static_ip(&mut new_cred)?;
+        let static_reservation = self.prepare_static_ip_with_proxy_origin(&mut new_cred, proxy_auto_assigned)?;
 
         // 3. 验证凭据有效性（API Key 无需网络刷新）
         let mut validated_cred = if new_cred.is_api_key_credential() {
@@ -5498,11 +5507,11 @@ mod tests {
 
     #[test]
     fn traffic_partial_policy_edits_preserve_other_types_and_validate_atomically() {
-        use crate::kiro::traffic::{AccountTier, Limits, TrafficPolicyPatch};
+        use crate::kiro::traffic::{AccountTier, LimitPatch, TrafficPolicyPatch};
         let manager = rpm_test_manager(false, 60);
         for (tier, concurrency, rpm) in [(AccountTier::Power, 300, 200), (AccountTier::Max, 100, 50)] {
             manager.patch_traffic_policies(TrafficPolicyPatch {
-                tiers: [(tier, Limits { concurrency: Some(concurrency), rpm: Some(rpm) })].into(), ..Default::default()
+                tiers: [(tier, LimitPatch { concurrency: Some(Some(concurrency)), rpm: Some(Some(rpm)) })].into(), ..Default::default()
             }).unwrap();
         }
         let invalid = manager.patch_traffic_policies(TrafficPolicyPatch {
@@ -5513,6 +5522,45 @@ mod tests {
         assert_eq!(policy.tiers[&AccountTier::Power].rpm, Some(200));
         assert_eq!(policy.tiers[&AccountTier::Max].rpm, Some(50));
         assert!(policy.auto_disable_quota);
+    }
+
+    #[test]
+    fn traffic_field_patches_preserve_other_fields_null_zero_and_atomic_validation() {
+        use crate::kiro::traffic::AccountTier;
+        let manager = rpm_test_manager(false, 60);
+        let patch = |value| manager.patch_traffic_policies(serde_json::from_value(value).unwrap());
+        patch(serde_json::json!({"tiers":{"power":{"concurrency":10,"rpm":20}}})).unwrap();
+        patch(serde_json::json!({"tiers":{"power":{"concurrency":30}}})).unwrap();
+        patch(serde_json::json!({"tiers":{"power":{"rpm":40}}})).unwrap();
+        let policy = manager.traffic_policies();
+        assert_eq!((policy.tiers[&AccountTier::Power].concurrency, policy.tiers[&AccountTier::Power].rpm), (Some(30), Some(40)));
+        patch(serde_json::json!({"tiers":{"power":{"concurrency":null}}})).unwrap();
+        patch(serde_json::json!({"tiers":{"power":{"rpm":0}}})).unwrap();
+        assert!(patch(serde_json::json!({"tiers":{"power":{"concurrency":100001}},"autoDisableQuota":false})).is_err());
+        let policy = manager.traffic_policies();
+        assert_eq!((policy.tiers[&AccountTier::Power].concurrency, policy.tiers[&AccountTier::Power].rpm), (None, Some(0)));
+        assert!(policy.auto_disable_quota);
+    }
+
+    #[test]
+    fn traffic_field_patches_concurrently_merge_same_tier_in_either_order() {
+        use crate::kiro::traffic::AccountTier;
+        let manager = Arc::new(rpm_test_manager(false, 60));
+        for _ in 0..30 {
+            manager.patch_traffic_policies(serde_json::from_value(serde_json::json!({"tiers":{"power":{"concurrency":10,"rpm":20}}})).unwrap()).unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let workers: Vec<_> = [serde_json::json!({"tiers":{"power":{"concurrency":30}}}), serde_json::json!({"tiers":{"power":{"rpm":40}}})]
+                .into_iter().map(|value| {
+                    let manager = manager.clone(); let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait(); manager.patch_traffic_policies(serde_json::from_value(value).unwrap()).unwrap();
+                    })
+                }).collect();
+            barrier.wait();
+            for worker in workers { worker.join().unwrap(); }
+            let policy = manager.traffic_policies();
+            assert_eq!((policy.tiers[&AccountTier::Power].concurrency, policy.tiers[&AccountTier::Power].rpm), (Some(30), Some(40)));
+        }
     }
 
     #[test]

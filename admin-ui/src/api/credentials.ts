@@ -172,6 +172,12 @@ export async function getCredentialBalance(id: number): Promise<BalanceResponse>
   return data
 }
 
+// 手动复查强制查询上游；预留服务端 45 秒查询及等待在途查询的时间。
+export async function refreshCredentialBalance(id: number): Promise<BalanceResponse> {
+  const { data } = await api.post<BalanceResponse>(`/credentials/${id}/balance/refresh`, undefined, { timeout: 120000 })
+  return data
+}
+
 // 获取凭据当前可用的模型列表（实时查询上游并更新服务端缓存）
 export async function getCredentialModels(id: number): Promise<AvailableModelsResponse> {
   const { data } = await api.get<AvailableModelsResponse>(`/credentials/${id}/models`)

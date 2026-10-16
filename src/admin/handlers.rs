@@ -167,6 +167,18 @@ pub async fn get_credential_balance(
     }
 }
 
+/// POST /api/admin/credentials/:id/balance/refresh
+/// 手动复查指定账号的最新额度，绕过旧缓存并复用查询合并及额度策略。
+pub async fn refresh_credential_balance(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.refresh_balance(id, true).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => e.into_http_response(),
+    }
+}
+
 /// GET /api/admin/credentials/:id/models
 /// 获取指定凭据当前可用的模型列表（按需实时查询上游）
 pub async fn get_credential_models(

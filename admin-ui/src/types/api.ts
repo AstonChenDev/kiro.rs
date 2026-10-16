@@ -198,6 +198,8 @@ export interface AddCredentialRequest {
   apiRegion?: string
   machineId?: string
   proxyUrl?: string
+  /** 自动选取的共享代理仅作备用，允许后端优先分配静态 IP。 */
+  proxyAutoAssigned?: boolean
   proxyUsername?: string
   proxyPassword?: string
   kiroApiKey?: string

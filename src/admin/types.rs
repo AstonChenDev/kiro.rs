@@ -207,6 +207,10 @@ pub struct AddCredentialRequest {
     /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
     pub proxy_url: Option<String>,
 
+    /// 界面自动选取的共享代理，只作为静态 IP 不适用时的备用。
+    #[serde(default)]
+    pub proxy_auto_assigned: bool,
+
     /// 凭据级代理认证用户名（可选）
     pub proxy_username: Option<String>,
 

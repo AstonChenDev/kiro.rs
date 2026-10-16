@@ -322,7 +322,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           account.idp?.trim() ||
           (isExternalIdp ? 'AzureAD' : undefined)
 
-        // KAM 账号无 proxyUrl 字段，无代理时从池中随机分配一个
+        // 池中自动选取的代理仅作备用；静态 IP 自动分配由后端优先判断。
         const proxyUrl = enabledProxies.length > 0
           ? enabledProxies[Math.floor(Math.random() * enabledProxies.length)].url
           : undefined
@@ -348,6 +348,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             traffic: account.traffic,
             email: account.email?.trim() || undefined,
             proxyUrl,
+            proxyAutoAssigned: !!proxyUrl,
           },
         })
       }

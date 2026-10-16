@@ -171,13 +171,16 @@ impl StaticIpInput {
         let username = self.username.filter(|s| !s.is_empty());
         let password = self.password.filter(|s| !s.is_empty());
         if password.is_some() && username.is_none() { return Err(invalid("填写代理密码时也需要填写用户名")); }
+        // A supplied username authenticates even when its password is empty.
+        // The ordinary proxy client requires both fields to be present.
+        let password = password.or_else(|| username.as_ref().map(|_| String::new()));
         Ok(StaticIp { id, url: format!("{}://{}:{}", self.protocol, host, self.port), username, password,
             label: self.label.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()), enabled: true })
     }
 }
 impl StaticIpStore {
     pub(super) fn load(path: Option<PathBuf>) -> anyhow::Result<Self> {
-        let inventory = match path.as_ref().map(std::fs::read).transpose() {
+        let mut inventory = match path.as_ref().map(std::fs::read).transpose() {
             Ok(Some(bytes)) => serde_json::from_slice::<Inventory>(&bytes)
                 .map_err(|_| invalid("静态 IP 配置文件损坏，请恢复备份后再启动"))?,
             Ok(None) => Inventory::default(),
@@ -186,9 +189,13 @@ impl StaticIpStore {
         };
         validate_providers(&inventory.allowed_providers)?;
         let mut keys = HashSet::new();
-        for entry in &inventory.entries {
+        for entry in &mut inventory.entries {
             let key = endpoint_key(&entry.url).ok_or_else(|| invalid("静态 IP 配置包含无效地址"))?;
             if !keys.insert(key) { return Err(invalid("静态 IP 配置包含重复地址")); }
+            // Older static inventories discarded empty passwords on input.
+            if entry.username.as_deref().is_some_and(|v| !v.is_empty()) && entry.password.is_none() {
+                entry.password = Some(String::new());
+            }
         }
         Ok(Self { inventory, reserved: HashSet::new(), ordinary_imports: HashMap::new(), active_proxy_hosts: HashMap::new(), path })
     }
@@ -350,6 +357,12 @@ impl MultiTokenManager {
             } else if !managed && c.static_ip_required && !allowed && !proxy_busy(e) {
                 c.static_ip_required=false; changed=true;
             }
+            // Repair already-bound accounts written by the old static input path.
+            // Leave in-flight operations and ordinary proxies untouched.
+            if managed && allowed && !e.disabled && !proxy_busy(e)
+                && c.proxy_username.as_deref().is_some_and(|v| !v.is_empty()) && c.proxy_password.is_none() {
+                c.proxy_password=Some(String::new()); changed=true;
+            }
         }
         let mut used: HashSet<_> = snapshot.iter().filter_map(|c| c.proxy_url.as_deref().and_then(endpoint_key)).collect();
         for (e, c) in entries.iter().zip(snapshot.iter_mut()) {
@@ -470,7 +483,11 @@ impl MultiTokenManager {
         if let Some(key) = &key { *store.ordinary_imports.entry(key.clone()).or_default() += 1; }
         Ok(Some(Reservation { manager:self.clone(), key, exclusive:false, proxy }))
     }
+    #[cfg(test)]
     pub(super) fn prepare_static_ip(self: &Arc<Self>, cred: &mut KiroCredentials) -> anyhow::Result<Option<Reservation>> {
+        self.prepare_static_ip_with_proxy_origin(cred, false)
+    }
+    pub(super) fn prepare_static_ip_with_proxy_origin(self: &Arc<Self>, cred: &mut KiroCredentials, proxy_auto_assigned: bool) -> anyhow::Result<Option<Reservation>> {
         self.reconcile_static_ips()?;
         let mut store = self.static_ips.lock();
         // Imported lifecycle flags are never authoritative.
@@ -478,6 +495,11 @@ impl MultiTokenManager {
         if !eligible(&store.inventory, cred) {
             if store.contains(cred.proxy_url.as_deref()) { return Err(invalid("该凭据类型不允许使用静态 IP")); }
             return self.reserve_ordinary_import(&mut store, cred);
+        }
+        // Decide under the inventory lock at import time, not from a UI snapshot.
+        // A user-selected proxy remains explicit; a UI-selected pool proxy is a fallback.
+        if proxy_auto_assigned && store.inventory.auto_assign {
+            cred.proxy_url = None; cred.proxy_username = None; cred.proxy_password = None;
         }
         let explicit = cred.proxy_url.as_deref().filter(|s| !s.trim().is_empty());
         let selected = if let Some(url) = explicit {
@@ -652,6 +674,144 @@ mod tests {
     fn temp_dir() -> PathBuf {
         let p=std::env::temp_dir().join(format!("kiro-static-{}",uuid::Uuid::new_v4()));std::fs::create_dir(&p).unwrap();p
     }
+
+    #[tokio::test]
+    async fn static_empty_password_authentication_survives_binding_and_real_connection() {
+        use tokio::io::{AsyncReadExt,AsyncWriteExt};
+        for password in [None,Some(String::new()),Some("fixture-password".into())] {
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port=listener.local_addr().unwrap().port();
+            let mut c=account("empty-password");c.id=Some(1);
+            let m=manager(None,vec![c]);
+            m.static_ip_import(vec![StaticIpInput {host:"127.0.0.1".into(),port,protocol:"http".into(),username:Some("fixture-user".into()),password:password.clone(),label:None}]).unwrap();
+            m.static_ip_auto_assign(true).unwrap();
+            let mut imported=account("import");
+            let reservation=m.prepare_static_ip(&mut imported).unwrap();
+            assert_eq!(imported.proxy_password.as_deref(),Some(password.as_deref().unwrap_or("")));
+            assert_eq!(reservation.as_ref().unwrap().proxy.password,imported.proxy_password);
+            drop(reservation);
+            m.static_ip_bind(1,Some(1)).unwrap();
+            let bound=m.clone_credential(1).unwrap();
+            let proxy_use=m.prepare_proxy_use(&bound,bound.effective_proxy(None).as_ref()).await.unwrap();
+            let client=crate::http_client::build_client(proxy_use.proxy(),3,crate::model::config::TlsBackend::Rustls).unwrap();
+            let request=tokio::spawn(async move {client.get("http://static-auth-probe.invalid/").send().await.unwrap().status()});
+            let (mut socket,_)=tokio::time::timeout(StdDuration::from_secs(4),listener.accept()).await.unwrap().unwrap();
+            let mut raw=Vec::new();
+            while !raw.ends_with(b"\r\n\r\n") {
+                let mut bytes=[0u8;2048];
+                let n=tokio::time::timeout(StdDuration::from_secs(4),socket.read(&mut bytes)).await.unwrap().unwrap();
+                assert!(n>0);raw.extend_from_slice(&bytes[..n]);
+            }
+            use base64::Engine;
+            let expected=base64::engine::general_purpose::STANDARD.encode(format!("fixture-user:{}",password.as_deref().unwrap_or("")));
+            assert!(String::from_utf8(raw).unwrap().to_ascii_lowercase().contains(&format!("proxy-authorization: basic {}",expected.to_ascii_lowercase())));
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            assert_eq!(request.await.unwrap(),reqwest::StatusCode::OK);
+        }
+    }
+
+    #[test]
+    fn static_empty_password_legacy_inventory_and_binding_recover_on_restart() {
+        let dir=temp_dir();let path=dir.join("credentials.json");
+        let mut c=account("legacy-empty-password");c.id=Some(1);
+        c.proxy_url=Some("http://192.0.2.10:3000".into());c.proxy_username=Some("fixture-user".into());
+        c.static_ip_required=true;
+        std::fs::write(&path,serde_json::to_vec(&vec![c.clone()]).unwrap()).unwrap();
+        std::fs::write(dir.join("static_ips.json"),serde_json::to_vec(&Inventory { entries:vec![StaticIp {id:1,url:c.proxy_url.clone().unwrap(),username:c.proxy_username.clone(),password:None,label:None,enabled:true}],..Default::default() }).unwrap()).unwrap();
+        let m=manager(Some(path.clone()),vec![c]);
+        assert_eq!(m.static_ips.lock().inventory.entries[0].password.as_deref(),Some(""));
+        assert_eq!(m.clone_credential(1).unwrap().effective_proxy(None).unwrap().password.as_deref(),Some(""));
+        let saved:Vec<KiroCredentials>=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved[0].proxy_password.as_deref(),Some(""));
+        let restarted=manager(Some(path),saved);
+        assert_eq!(restarted.clone_credential(1).unwrap().effective_proxy(None).unwrap().username.as_deref(),Some("fixture-user"));
+        // A newly rebound account also obtains the repaired inventory password.
+        restarted.static_ip_bind(1,None).unwrap();restarted.static_ip_bind(1,Some(1)).unwrap();
+        assert_eq!(restarted.clone_credential(1).unwrap().proxy_password.as_deref(),Some(""));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn static_empty_password_repair_waits_for_requests_and_preserves_ordinary_proxies() {
+        let mut c=account("existing");c.id=Some(1);c.proxy_url=Some("http://192.0.2.10:3000".into());c.proxy_username=Some("fixture-user".into());
+        let m=manager(None,vec![c]);
+        m.static_ip_import(vec![StaticIpInput{username:Some("fixture-user".into()),password:None,..input("192.0.2.10")}]).unwrap();
+        m.entries.lock()[0].proxy_operations.store(1,Ordering::Release);
+        m.reconcile_static_ips().unwrap();assert!(m.clone_credential(1).unwrap().proxy_password.is_none());
+        m.entries.lock()[0].proxy_operations.store(0,Ordering::Release);
+        m.reconcile_static_ips().unwrap();assert_eq!(m.clone_credential(1).unwrap().proxy_password.as_deref(),Some(""));
+        let mut ordinary=account("ordinary");ordinary.id=Some(2);ordinary.proxy_url=Some("http://192.0.2.11:3000".into());ordinary.proxy_username=Some("ordinary-user".into());
+        let ordinary=manager(None,vec![ordinary]);ordinary.reconcile_static_ips().unwrap();
+        assert!(ordinary.clone_credential(2).unwrap().proxy_password.is_none());
+        let m=manager(None,vec![]);let mut no_auth=input("192.0.2.12");no_auth.username=None;no_auth.password=Some(String::new());
+        m.static_ip_import(vec![no_auth]).unwrap();
+        assert!(m.static_ips.lock().inventory.entries[0].username.is_none());
+        assert!(m.static_ips.lock().inventory.entries[0].password.is_none());
+    }
+    #[test]
+    fn auto_pool_fallback_yields_to_static_ip_but_explicit_proxies_remain_explicit() {
+        let m = manager(None, vec![]);
+        m.static_ip_import(vec![input("192.0.2.10")]).unwrap();
+        m.static_ip_auto_assign(true).unwrap();
+        let fallback = || { let mut c = account("fallback"); c.proxy_url = Some("http://127.0.0.9:3000".into());
+            c.proxy_username = Some("shared-user".into()); c.proxy_password = Some("shared-pass".into()); c };
+        let mut c = fallback();
+        let guard = m.prepare_static_ip_with_proxy_origin(&mut c, true).unwrap().unwrap();
+        assert!(guard.exclusive && c.static_ip_required);
+        assert_eq!(c.proxy_url.as_deref(), Some("http://192.0.2.10:3000"));
+        assert_eq!(c.proxy_username.as_deref(), Some("vendor-user"));
+        assert_eq!(c.proxy_password.as_deref(), Some("test-only-password"));
+        drop(guard);
+        for url in ["direct", "http://127.0.0.9:3000"] {
+            let mut c = fallback(); c.proxy_url = Some(url.into());
+            let guard = m.prepare_static_ip_with_proxy_origin(&mut c, false).unwrap();
+            assert!(!c.static_ip_required); assert_eq!(c.proxy_url.as_deref(), Some(url));
+            if let Some(guard) = guard { assert!(!guard.exclusive); }
+        }
+        assert_eq!(m.static_ip_list().entries[0].status, "free");
+    }
+
+    #[test]
+    fn auto_pool_fallback_cannot_bypass_static_exhaustion_and_uses_current_policy() {
+        let m = manager(None, vec![]);
+        let fallback = || { let mut c = account("fallback"); c.proxy_url = Some("http://127.0.0.9:3000".into()); c };
+        m.static_ip_auto_assign(true).unwrap();
+        let mut c = fallback();
+        let error = m.prepare_static_ip_with_proxy_origin(&mut c, true).err().unwrap();
+        assert!(error.to_string().contains("没有空闲静态 IP"));
+        assert!(m.static_ip_list().entries.is_empty());
+        m.static_ip_auto_assign(false).unwrap();
+        let mut c = fallback();
+        let guard = m.prepare_static_ip_with_proxy_origin(&mut c, true).unwrap().unwrap();
+        assert!(!guard.exclusive && !c.static_ip_required);
+        assert_eq!(c.proxy_url.as_deref(), Some("http://127.0.0.9:3000"));
+    }
+
+    #[test]
+    fn auto_pool_fallback_respects_personal_provider_whitelist_and_excludes_api_keys() {
+        let m = manager(None, vec![]);
+        m.static_ip_import(vec![input("192.0.2.10")]).unwrap();
+        m.static_ip_auto_assign(true).unwrap();
+        for (method, provider, key, expected) in [
+            ("social", Some("Google"), None, true),
+            ("social", None, None, false),
+            ("idc", Some("Enterprise"), None, false),
+            ("external_idp", Some("Github"), None, false),
+            ("api_key", Some("Github"), Some("ksk-fixture"), false),
+            ("idc", Some("BuilderID"), None, false),
+        ] {
+            let mut c = account("test"); c.auth_method = Some(method.into()); c.provider = provider.map(str::to_owned);
+            c.kiro_api_key = key.map(str::to_owned); c.proxy_url = Some("http://127.0.0.9:3000".into());
+            let guard = m.prepare_static_ip_with_proxy_origin(&mut c, true).unwrap().unwrap();
+            assert_eq!(guard.exclusive, expected); assert_eq!(c.static_ip_required, expected);
+        }
+        m.static_ip_config(None, Some(vec!["builderid".into()])).unwrap();
+        let mut c = account("builder"); c.auth_method = Some("idc".into()); c.provider = Some("BuilderID".into());
+        c.proxy_url = Some("http://127.0.0.9:3000".into());
+        let guard = m.prepare_static_ip_with_proxy_origin(&mut c, true).unwrap().unwrap();
+        assert!(guard.exclusive && c.static_ip_required);
+    }
+
     #[test]
     fn batch_is_atomic_and_same_ip_cannot_be_registered_with_another_port() {
         let m=manager(None,vec![]);
