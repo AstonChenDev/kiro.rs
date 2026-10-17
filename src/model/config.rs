@@ -372,7 +372,7 @@ fn default_upstream_connect_timeout_secs() -> u64 {
     15
 }
 fn default_upstream_request_timeout_secs() -> u64 {
-    1200
+    3600
 }
 fn default_upstream_read_timeout_secs() -> u64 {
     120
@@ -628,7 +628,7 @@ mod tests {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(config.upstream_connect_timeout_secs, 15);
         assert_eq!(config.upstream_read_timeout_secs, 120);
-        assert_eq!(config.upstream_request_timeout_secs, 1200);
+        assert_eq!(config.upstream_request_timeout_secs, 3600);
         assert_eq!(Config::default().upstream_connect_timeout_secs, 15);
         assert_eq!(Config::default().upstream_read_timeout_secs, 120);
     }
@@ -636,12 +636,12 @@ mod tests {
     #[test]
     fn upstream_deadlines_accept_explicit_values() {
         let config: Config = serde_json::from_str(
-            r#"{"upstreamConnectTimeoutSecs":7,"upstreamReadTimeoutSecs":45,"upstreamRequestTimeoutSecs":1200}"#,
+            r#"{"upstreamConnectTimeoutSecs":7,"upstreamReadTimeoutSecs":45,"upstreamRequestTimeoutSecs":3600}"#,
         )
         .unwrap();
         assert_eq!(config.upstream_connect_timeout_secs, 7);
         assert_eq!(config.upstream_read_timeout_secs, 45);
-        assert_eq!(config.upstream_request_timeout_secs, 1200);
+        assert_eq!(config.upstream_request_timeout_secs, 3600);
     }
 
     #[test]
