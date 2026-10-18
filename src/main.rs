@@ -123,6 +123,10 @@ async fn main() {
     {
         let ide = IdeEndpoint::new();
         endpoints.insert(ide.name().to_string(), Arc::new(ide));
+        let codewhisperer = IdeEndpoint::codewhisperer();
+        endpoints.insert(codewhisperer.name().to_string(), Arc::new(codewhisperer));
+        let amazonq = IdeEndpoint::amazonq();
+        endpoints.insert(amazonq.name().to_string(), Arc::new(amazonq));
         let cli = CliEndpoint::new();
         endpoints.insert(cli.name().to_string(), Arc::new(cli));
     }

@@ -1564,7 +1564,7 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
   };
 
   const handleToggleLoadBalancing = () => {
-    const cur = loadBalancingData?.mode || "priority";
+    const cur = loadBalancingData?.mode || "balanced";
     const next = cur === "priority" ? "balanced" : "priority";
     setLoadBalancingMode(next, {
       onSuccess: () =>

@@ -14,13 +14,32 @@ use crate::kiro::kiro_version;
 
 /// Kiro IDE 端点名称
 pub const IDE_ENDPOINT_NAME: &str = "ide";
+pub const CODEWHISPERER_ENDPOINT_NAME: &str = "codewhisperer";
+pub const AMAZONQ_ENDPOINT_NAME: &str = "amazonq";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdeEndpointKind {
+    Kiro,
+    CodeWhisperer,
+    AmazonQ,
+}
 
 /// Kiro IDE 端点
-pub struct IdeEndpoint;
+pub struct IdeEndpoint {
+    kind: IdeEndpointKind,
+}
 
 impl IdeEndpoint {
     pub fn new() -> Self {
-        Self
+        Self { kind: IdeEndpointKind::Kiro }
+    }
+
+    pub fn codewhisperer() -> Self {
+        Self { kind: IdeEndpointKind::CodeWhisperer }
+    }
+
+    pub fn amazonq() -> Self {
+        Self { kind: IdeEndpointKind::AmazonQ }
     }
 
     fn api_region<'a>(&self, ctx: &'a RequestContext<'_>) -> &'a str {
@@ -28,7 +47,11 @@ impl IdeEndpoint {
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("q.{}.amazonaws.com", self.api_region(ctx))
+        let host = match self.kind {
+            IdeEndpointKind::CodeWhisperer => "codewhisperer",
+            IdeEndpointKind::Kiro | IdeEndpointKind::AmazonQ => "q",
+        };
+        format!("{host}.{}.amazonaws.com", self.api_region(ctx))
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
@@ -58,12 +81,20 @@ impl Default for IdeEndpoint {
 
 impl KiroEndpoint for IdeEndpoint {
     fn name(&self) -> &'static str {
-        IDE_ENDPOINT_NAME
+        match self.kind {
+            IdeEndpointKind::Kiro => IDE_ENDPOINT_NAME,
+            IdeEndpointKind::CodeWhisperer => CODEWHISPERER_ENDPOINT_NAME,
+            IdeEndpointKind::AmazonQ => AMAZONQ_ENDPOINT_NAME,
+        }
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
+        let host = match self.kind {
+            IdeEndpointKind::CodeWhisperer => "codewhisperer",
+            IdeEndpointKind::Kiro | IdeEndpointKind::AmazonQ => "q",
+        };
         format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
+            "https://{host}.{}.amazonaws.com/generateAssistantResponse",
             self.api_region(ctx)
         )
     }
@@ -82,6 +113,22 @@ impl KiroEndpoint for IdeEndpoint {
             .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
+
+        match self.kind {
+            IdeEndpointKind::Kiro => {}
+            IdeEndpointKind::CodeWhisperer => {
+                req = req.header(
+                    "x-amz-target",
+                    "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+                );
+            }
+            IdeEndpointKind::AmazonQ => {
+                req = req.header(
+                    "x-amz-target",
+                    "AmazonQDeveloperStreamingService.SendMessage",
+                );
+            }
+        }
 
         if let Some(token_type) = ctx.credentials.token_type_header() {
             req = req.header("tokentype", token_type);
@@ -127,7 +174,7 @@ fn inject_profile_arn(request_body: &str, profile_arn: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::inject_profile_arn;
+    use super::{inject_profile_arn, IdeEndpoint, KiroEndpoint, RequestContext};
     use serde_json::Value;
 
     #[test]
@@ -167,5 +214,47 @@ mod tests {
         let arn = Some("arn:test".to_string());
         let result = inject_profile_arn(body, arn.as_deref());
         assert_eq!(result, "not-valid-json");
+    }
+
+    #[test]
+    fn oauth_fallback_variants_use_expected_host_and_target() {
+        let client = reqwest::Client::new();
+        let credentials = crate::kiro::model::credentials::KiroCredentials::default();
+        let config = crate::model::config::Config::default();
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        let cases = [
+            (IdeEndpoint::new(), "ide", "q.us-east-1.amazonaws.com", None),
+            (
+                IdeEndpoint::codewhisperer(),
+                "codewhisperer",
+                "codewhisperer.us-east-1.amazonaws.com",
+                Some("AmazonCodeWhispererStreamingService.GenerateAssistantResponse"),
+            ),
+            (
+                IdeEndpoint::amazonq(),
+                "amazonq",
+                "q.us-east-1.amazonaws.com",
+                Some("AmazonQDeveloperStreamingService.SendMessage"),
+            ),
+        ];
+
+        for (endpoint, name, host, target) in cases {
+            assert_eq!(endpoint.name(), name);
+            let request = endpoint
+                .decorate_api(client.post(endpoint.api_url(&ctx)), &ctx)
+                .build()
+                .unwrap();
+            assert_eq!(request.url().host_str(), Some(host));
+            assert_eq!(
+                request.headers().get("x-amz-target").and_then(|v| v.to_str().ok()),
+                target
+            );
+        }
     }
 }

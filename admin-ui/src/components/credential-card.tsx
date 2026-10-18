@@ -1014,6 +1014,11 @@ function CredentialCardImpl({
           </div>
         ) : balance ? (
           <div>
+            {credential.disabled && (
+              <div className="mb-0.5 text-[10px] font-semibold text-amber-600 dark:text-amber-400">
+                当前不可调用
+              </div>
+            )}
             <div className="flex items-baseline justify-between gap-2 text-xs tabular-nums font-mono">
               <span
                 className={`font-semibold ${
@@ -1324,6 +1329,11 @@ function CredentialCardImpl({
                 </div>
               ) : balance ? (
                 <div className="space-y-2">
+                  {credential.disabled && (
+                    <div className="text-xs font-semibold text-amber-600 dark:text-amber-400">
+                      当前不可调用 · {disposition.stateLabel}
+                    </div>
+                  )}
                   <div className="flex items-baseline justify-between gap-2">
                     <div>
                       <div className="text-[10px] font-semibold text-muted-foreground uppercase">

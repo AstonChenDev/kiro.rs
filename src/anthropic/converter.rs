@@ -279,7 +279,7 @@ fn normalize_claude_model(model: &str) -> Option<String> {
 }
 
 /// 模型映射：自定义别名优先，已知 Claude 格式规范化，其余合法 ID 原样透传。
-pub fn map_model(model: &str) -> Option<String> {
+pub(crate) fn map_model(model: &str) -> Option<String> {
     if invalid_model_reason(model).is_some() {
         return None;
     }

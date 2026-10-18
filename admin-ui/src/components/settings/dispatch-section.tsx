@@ -57,13 +57,13 @@ function LoadBalancingGroup() {
         label="负载均衡模式"
         hint={
           data?.mode === 'balanced'
-            ? '按用量动态挑选凭据，把请求摊平到整个池子'
+            ? '按 Kiro-Go 风格轮询可用凭据；失败、禁用和冷却账号会自动跳过'
             : '按优先级数字从小到大用：先用完 0 号，再换 1 号'
         }
-        value={data?.mode ?? 'priority'}
+        value={data?.mode ?? 'balanced'}
         options={[
           { value: 'priority', label: '按优先级', hint: '小数字先用，顺序耗尽' },
-          { value: 'balanced', label: '均衡负载', hint: '按用量动态摊平' },
+          { value: 'balanced', label: '均衡负载', hint: '按可用账号轮询' },
         ]}
         onChange={(next) => saver.save('mode', next)}
         pending={saver.isSaving('mode')}

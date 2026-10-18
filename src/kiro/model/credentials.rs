@@ -552,6 +552,7 @@ pub struct KiroCredentials {
     /// 端点名称（可选）
     ///
     /// 决定该凭据走哪套 Kiro API。未配置时回退到 `config.defaultEndpoint`（默认 "ide"）。
+    /// OAuth 账号支持 `ide`、`codewhisperer`、`amazonq`，API Key 使用 `cli`。
     /// 端点名必须在启动时注册的端点 registry 中存在。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,

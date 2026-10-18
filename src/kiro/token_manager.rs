@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, Semaphore};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -117,6 +117,10 @@ pub(crate) fn validate_refresh_token_str(refresh_token: &str) -> anyhow::Result<
 pub(crate) struct RefreshTokenInvalidError {
     pub message: String,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("凭据已被禁用")]
+struct CredentialDisabledError;
 
 impl fmt::Display for RefreshTokenInvalidError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1284,6 +1288,9 @@ pub struct MultiTokenManager {
     is_multiple_format: AtomicBool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// 轮询调度游标。balanced 模式按全部可用账号轮转，priority 模式
+    /// 仍只在最高优先级账号中轮转。
+    selection_cursor: Mutex<u64>,
     /// 会话粘性路由：会话 → 上一轮成功凭据 的绑定表（运行时可开关 / 改 TTL）
     session_affinity: SessionAffinity,
     /// 账号级 429 限流故障转移开关（运行时可修改）
@@ -1534,7 +1541,18 @@ impl MultiTokenManager {
             .map(|e| e.id)
             .unwrap_or(0);
 
-        let load_balancing_mode = config.load_balancing_mode.clone();
+        // Configs created before the Kiro-Go-style default used `priority` with
+        // every account at priority 0. Migrate that implicit default in memory
+        // so an existing deployment gets round-robin behavior without changing
+        // explicitly ordered priority pools.
+        let load_balancing_mode = if config.config_path().is_some()
+            && config.load_balancing_mode == "priority"
+            && entries.iter().all(|entry| entry.credentials.priority == 0)
+        {
+            "balanced".to_string()
+        } else {
+            config.load_balancing_mode.clone()
+        };
         let session_affinity = SessionAffinity::new(
             config.session_affinity_enabled,
             config.session_affinity_ttl_secs,
@@ -1569,6 +1587,7 @@ impl MultiTokenManager {
             balance_cache_write_lock: Mutex::new(()),
             is_multiple_format: AtomicBool::new(is_multiple_format),
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            selection_cursor: Mutex::new(0),
             session_affinity,
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
@@ -1710,6 +1729,8 @@ impl MultiTokenManager {
         let Some(model) = model else {
             return CachedModelSupport::Unknown;
         };
+        let requested_model = crate::anthropic::converter::map_model(model)
+            .unwrap_or_else(|| model.to_ascii_lowercase());
         let cache = self.model_cache.lock();
         let Some(entry) = cache.get(&id) else {
             return CachedModelSupport::Unknown;
@@ -1718,7 +1739,11 @@ impl MultiTokenManager {
             .response
             .models
             .iter()
-            .any(|available| available.model_id.eq_ignore_ascii_case(model))
+            .any(|available| {
+                crate::anthropic::converter::map_model(&available.model_id)
+                    .unwrap_or_else(|| available.model_id.to_ascii_lowercase())
+                    == requested_model
+            })
         {
             CachedModelSupport::Confirmed
         } else {
@@ -2301,7 +2326,7 @@ impl MultiTokenManager {
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：在可用凭据中均匀随机选择一个
+    /// - balanced 模式：在全部可用凭据中按 Kiro-Go 风格轮询
     ///
     /// 会话粘性由调用方在此之前处理（见 [`Self::sticky_candidate`]），这里只负责
     /// 粘性未命中 / 无会话时的选号。
@@ -2313,6 +2338,15 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> Option<(u64, KiroCredentials)> {
+        self.select_next_credential_excluding(model, group, None)
+    }
+
+    fn select_next_credential_excluding(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded: Option<&HashSet<u64>>,
+    ) -> Option<(u64, KiroCredentials)> {
         let store = self.static_ips.lock();
         let entries = self.entries.lock();
         let now = Instant::now();
@@ -2320,6 +2354,7 @@ impl MultiTokenManager {
         // 过滤可用凭据（已排除模型缓存明确不支持的凭据）
         let available: Vec<&CredentialEntry> = entries
             .iter()
+            .filter(|entry| excluded.is_none_or(|ids| !ids.contains(&entry.id)))
             .filter(|e| self.entry_available_for_request(e, model, group, now))
             .filter(|e| static_ips::check_static_binding(&store, &entries, e).is_ok())
             .collect();
@@ -2333,24 +2368,85 @@ impl MultiTokenManager {
 
         let entry = match mode {
             "balanced" => {
-                // 均匀随机，不按历史 success_count / 模型缓存状态排序：
-                // - 按 success_count 取最小会让新加入的凭据（计数为 0）独占流量，
-                //   直到追平老凭据的累计值；
-                // - 优先模型缓存 Confirmed 会让缓存为 Unknown 的凭据（运行时新增、
-                //   缓存被清空后）在有 Confirmed 凭据可用时永远选不到，缓存也就永远
-                //   不会因为被使用而变成 Confirmed。
-                available[fastrand::usize(..available.len())]
+                // Kiro-Go 风格的轮询：每次只在当前可用池中顺序取下一个账号。
+                // 失败/冷却/超额账号已经在 available 构建阶段排除；账号恢复后
+                // 会自动重新加入轮询池。
+                let mut ordered = available;
+                ordered.sort_by_key(|entry| entry.id);
+                let minimum_capacity = ordered
+                    .iter()
+                    .map(|entry| self.selection_capacity(entry))
+                    .min()
+                    .unwrap_or(1);
+                let slots = ordered
+                    .iter()
+                    .map(|entry| {
+                        let capacity = self.selection_capacity(entry);
+                        // Kiro-Go uses an explicit account weight. This project
+                        // already has tier RPM/concurrency policies, so derive a
+                        // bounded weight from those capacities when no explicit
+                        // weight exists. Larger accounts receive more turns while
+                        // every available account remains in the pool.
+                        ((capacity + minimum_capacity - 1) / minimum_capacity)
+                            .clamp(1, 20) as usize
+                    })
+                    .collect::<Vec<_>>();
+                let max_slots = slots.iter().copied().max().unwrap_or(1);
+                // Interleave weighted rounds instead of grouping all POWER
+                // requests together. This preserves Kiro-Go's weighted pool
+                // behavior while still allowing larger accounts more turns.
+                let mut weighted_order = Vec::with_capacity(slots.iter().sum());
+                for round in 0..max_slots {
+                    for (entry, count) in ordered.iter().zip(&slots) {
+                        if *count > round {
+                            weighted_order.push(*entry);
+                        }
+                    }
+                }
+                let total_slots = weighted_order.len().max(1);
+                let cursor = *self.selection_cursor.lock() as usize % total_slots;
+                let picked = weighted_order[cursor];
+                *self.selection_cursor.lock() = (cursor + 1) as u64;
+                picked
             }
             _ => {
-                // priority 模式（默认）：严格选择数字最小的有效凭据。
-                // 同优先级按 ID 升序固定顺序，保证后端调度与前端预览一致。
-                available
+                // priority 模式：先遵守 priority 数字，再在同一优先级内轮转。
+                // 这样默认优先级相同的账号都会得到请求，避免最小 ID 长期独占；
+                // disabled、冷却、RPM 打满和不支持模型的账号已在上面的过滤中排除。
+                let priority = available
+                    .iter()
+                    .map(|entry| entry.credentials.priority)
+                    .min()?;
+                let mut same_priority: Vec<&CredentialEntry> = available
+                    .into_iter()
+                    .filter(|entry| entry.credentials.priority == priority)
+                    .collect();
+                same_priority.sort_by_key(|entry| entry.id);
+                let cursor = *self.selection_cursor.lock();
+                let picked = same_priority
                     .iter()
                     .copied()
-                    .min_by_key(|e| (e.credentials.priority, e.id))?
+                    .find(|entry| entry.id > cursor)
+                    .or_else(|| same_priority.first().copied())?;
+                *self.selection_cursor.lock() = picked.id;
+                picked
             }
         };
         Some((entry.id, entry.credentials.clone()))
+    }
+
+    /// Effective capacity used by balanced routing as a Kiro-Go-style weight.
+    /// RPM is the best signal for burst capacity; concurrency is used when RPM
+    /// is unlimited. A zero/unknown policy remains weight 1.
+    fn selection_capacity(&self, entry: &CredentialEntry) -> u64 {
+        let limits = self.effective_limits(entry);
+        u64::from(if limits.rpm > 0 {
+            limits.rpm
+        } else if limits.concurrency > 0 {
+            limits.concurrency
+        } else {
+            1
+        })
     }
 
     /// 获取 API 调用上下文
@@ -2368,7 +2464,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> anyhow::Result<CallContext> {
-        self.acquire_context_impl(model, group, None, true)
+        self.acquire_context_impl(model, group, None, true, None)
             .await
             .map(|(context, _, _)| context)
     }
@@ -2384,7 +2480,23 @@ impl MultiTokenManager {
         group: Option<&str>,
         session: Option<&str>,
     ) -> anyhow::Result<(CallContext, RouteDecision)> {
-        self.acquire_context_impl(model, group, session, true)
+        self.acquire_context_impl(model, group, session, true, None)
+            .await
+            .map(|(context, _, route)| (context, route))
+    }
+
+    /// 获取上下文并跳过本次请求已经失败的凭据。
+    ///
+    /// 失败转移使用请求级排除集合，避免会话粘性或 priority 轮转把同一个
+    /// 失败账号重新选回来；账号仍保持全局可用状态，供后续新请求恢复使用。
+    pub async fn acquire_context_routed_excluding(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        session: Option<&str>,
+        excluded: &HashSet<u64>,
+    ) -> anyhow::Result<(CallContext, RouteDecision)> {
+        self.acquire_context_impl(model, group, session, true, Some(excluded))
             .await
             .map(|(context, _, route)| (context, route))
     }
@@ -2405,11 +2517,12 @@ impl MultiTokenManager {
 
     /// 粘性候选：会话有绑定、绑定凭据存在且当前可用 → 直接返回该凭据。
     /// 同时给出判定结果与「选号前的绑定」供 trace 使用。
-    fn sticky_candidate(
+    fn sticky_candidate_excluding(
         &self,
         session: Option<&str>,
         model: Option<&str>,
         group: Option<&str>,
+        excluded: Option<&HashSet<u64>>,
     ) -> (Option<(u64, KiroCredentials)>, RouteDecision) {
         let Some(session) = session else {
             return (None, RouteDecision::none());
@@ -2432,6 +2545,7 @@ impl MultiTokenManager {
         let pick = entries
             .iter()
             .find(|e| e.id == bound_id)
+            .filter(|e| excluded.is_none_or(|ids| !ids.contains(&e.id)))
             .filter(|e| self.entry_available_for_request(e, model, group, now))
             .filter(|e| static_ips::check_static_binding(&store, &entries, e).is_ok())
             .map(|e| (e.id, e.credentials.clone()));
@@ -2459,6 +2573,7 @@ impl MultiTokenManager {
         group: Option<&str>,
         session: Option<&str>,
         update_current: bool,
+        excluded: Option<&HashSet<u64>>,
     ) -> anyhow::Result<(CallContext, bool, RouteDecision)> {
         self.reconcile_static_ips()?;
         let total = self.total_count_in_group(group);
@@ -2484,8 +2599,10 @@ impl MultiTokenManager {
                 // 会话粘性优先：绑定凭据仍可用就沿用，保住上游按账号隔离的 prompt cache。
                 // 粘性未命中时两种模式都按当前请求重新选择。priority 模式不能复用 current_id，
                 // 否则高优先级凭据从 RPM/冷却恢复后无法在下一次请求立即回切。
-                let (sticky_pick, route) = self.sticky_candidate(session, model, group);
-                let mut best = sticky_pick.or_else(|| self.select_next_credential(model, group));
+                let (sticky_pick, route) =
+                    self.sticky_candidate_excluding(session, model, group, excluded);
+                let mut best = sticky_pick
+                    .or_else(|| self.select_next_credential_excluding(model, group, excluded));
 
                 if best.is_none() {
                     let store = self.static_ips.lock();
@@ -2497,7 +2614,7 @@ impl MultiTokenManager {
                 // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
                 // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
                 if best.is_none() && self.try_self_heal(model, group) {
-                    best = self.select_next_credential(model, group);
+                    best = self.select_next_credential_excluding(model, group, excluded);
                 }
 
                 let (id, credentials) = if let Some((new_id, new_creds)) = best {
@@ -2550,6 +2667,13 @@ impl MultiTokenManager {
                 (id, credentials, is_balanced, route)
             };
 
+            // 账号可能在选号后被另一条请求因超额/封禁禁用；禁用账号不得继续
+            // 进入 token 刷新或其它上游准备流程。
+            if !self.is_credential_enabled(id) {
+                attempt_count += 1;
+                continue;
+            }
+
             // 尝试获取/刷新 Token
             let identity = self.balance_identity(id)?;
             match self.try_ensure_token(id, &credentials).await {
@@ -2557,6 +2681,10 @@ impl MultiTokenManager {
                     return Ok((ctx, is_balanced, route));
                 }
                 Err(e) => {
+                    if e.downcast_ref::<CredentialDisabledError>().is_some() {
+                        attempt_count += 1;
+                        continue;
+                    }
                     // A binding can change between selection and lease acquisition.
                     // Reselect without recording a token failure or disabling an account.
                     if e.downcast_ref::<static_ips::StaticIpError>().is_some() {
@@ -2678,6 +2806,9 @@ impl MultiTokenManager {
         id: u64,
         _credentials: &KiroCredentials,
     ) -> anyhow::Result<CallContext> {
+        if !self.is_credential_enabled(id) {
+            return Err(CredentialDisabledError.into());
+        }
         let static_ip_lease = self.static_ip_lease(id)?;
         let fresh = self.clone_credential(id).ok_or_else(|| anyhow::anyhow!("凭据不存在: {id}"))?;
         let credentials = &fresh;
@@ -2714,6 +2845,9 @@ impl MultiTokenManager {
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
+                if !self.is_credential_enabled(id) {
+                    return Err(CredentialDisabledError.into());
+                }
                 let global_proxy = self.proxy.lock().clone();
                 let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
                 let _proxy_use = self.prepare_proxy_use(&current_creds, effective_proxy.as_ref()).await?;
@@ -3604,6 +3738,18 @@ impl MultiTokenManager {
             .map(CredentialEntry::credentials_snapshot)
     }
 
+    /// 检查凭据在进入上游准备阶段前是否仍处于启用状态。
+    ///
+    /// 选号和实际发起请求之间可能有并发状态变化（例如另一条请求刚刚确认
+    /// 额度耗尽并禁用了该账号）。调用方必须在任何新的上游调用前再次检查，
+    /// 避免继续为已禁用账号刷新 token 或解析 profile。
+    pub fn is_credential_enabled(&self, id: u64) -> bool {
+        self.entries
+            .lock()
+            .iter()
+            .any(|entry| entry.id == id && !entry.disabled)
+    }
+
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
         let entries = self.entries.lock();
@@ -4240,7 +4386,7 @@ impl MultiTokenManager {
     pub async fn get_available_models_for_current(
         &self,
     ) -> anyhow::Result<(u64, ListAvailableModelsResponse, bool)> {
-        let (context, is_balanced, _) = self.acquire_context_impl(None, None, None, false).await?;
+        let (context, is_balanced, _) = self.acquire_context_impl(None, None, None, false, None).await?;
         let id = context.id;
         let response = self.refresh_model_cache_for(id, true).await?;
         Ok((id, response, is_balanced))
@@ -6925,7 +7071,7 @@ mod tests {
         let mut picked_other = false;
         for _ in 0..64 {
             let (context, is_balanced, _) = manager
-                .acquire_context_impl(None, None, None, false)
+                .acquire_context_impl(None, None, None, false, None)
                 .await
                 .unwrap();
             assert!(is_balanced);
@@ -8434,6 +8580,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn priority_mode_rotates_equal_priority_accounts() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                grouped_cred("first", &[]),
+                grouped_cred("second", &[]),
+                grouped_cred("third", &[]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(manager.report_quota_exhausted(2));
+        let mut picked = Vec::new();
+        for _ in 0..4 {
+            picked.push(manager.acquire_context(None, None).await.unwrap().id);
+        }
+        assert_eq!(picked, vec![1, 3, 1, 3]);
+        assert!(manager
+            .snapshot()
+            .entries
+            .iter()
+            .find(|entry| entry.id == 2)
+            .is_some_and(|entry| entry.disabled));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn priority_rotation_high_concurrency_skips_quota_disabled_account() {
+        let manager = Arc::new(MultiTokenManager::new(
+            Config::default(),
+            (1..=8)
+                .map(|id| {
+                    let mut credential = api_key_cred(&format!("fixture-key-{id}"));
+                    credential.id = Some(id);
+                    credential
+                })
+                .collect(),
+            None,
+            None,
+            false,
+        )
+        .unwrap());
+        assert!(manager.report_quota_exhausted(4));
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(257));
+        let mut tasks = Vec::new();
+        for _ in 0..256 {
+            let manager = Arc::clone(&manager);
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let context = manager.acquire_context(None, None).await.unwrap();
+                let id = context.id;
+                let permit = manager
+                    .try_acquire_permit(id)
+                    .expect("启用账号应能获得并发许可");
+                drop(permit);
+                id
+            }));
+        }
+        barrier.wait().await;
+
+        let mut counts = std::collections::HashMap::new();
+        for task in tasks {
+            *counts.entry(task.await.unwrap()).or_insert(0usize) += 1;
+        }
+        assert_eq!(counts.get(&4), None, "超额禁用账号不应被高并发请求选中");
+        for id in [1, 2, 3, 5, 6, 7, 8] {
+            assert!(counts.get(&id).copied().unwrap_or(0) > 0, "账号 #{id} 未被调度");
+        }
+    }
+
+    #[tokio::test]
+    async fn request_retry_exclusion_skips_failed_sticky_credential() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            (1..=3)
+                .map(|id| {
+                    let mut credential = api_key_cred(&format!("fixture-key-{id}"));
+                    credential.id = Some(id);
+                    credential
+                })
+                .collect(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.bind_session("retry-session", 1);
+        let excluded = HashSet::from([1_u64]);
+
+        let (context, route) = manager
+            .acquire_context_routed_excluding(
+                None,
+                None,
+                Some("retry-session"),
+                &excluded,
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(context.id, 1);
+        assert_eq!(route.previous_credential_id, Some(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn power_account_accepts_100_concurrent_dated_model_requests() {
+        use crate::kiro::traffic::{AccountTier, Limits};
+
+        let mut config = Config::default();
+        config
+            .traffic_policies
+            .tiers
+            .insert(AccountTier::Power, Limits { concurrency: Some(300), rpm: Some(200) });
+        let mut power = api_key_cred("fixture-power-key");
+        power.id = Some(1);
+        power.subscription_title = Some("KIRO POWER".to_string());
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![power], None, None, false).unwrap(),
+        );
+        seed_model_cache(&manager, 1, &["claude-sonnet-4.5"]);
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(101));
+        let mut tasks = Vec::new();
+        for _ in 0..100 {
+            let manager = Arc::clone(&manager);
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let context = manager
+                    .acquire_context(Some("claude-sonnet-4-5-20250929"), None)
+                    .await
+                    .unwrap();
+                let id = context.id;
+                let permit = manager
+                    .try_acquire_permit(id)
+                    .expect("POWER 300 并发额度应接住 100 个请求");
+                drop(permit);
+                id
+            }));
+        }
+        barrier.wait().await;
+
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn test_acquire_context_priority_current_respects_model_support() {
         let mut free_cred = grouped_cred("free", &[]);
         free_cred.subscription_title = Some("KIRO FREE".to_string());
@@ -8659,7 +8956,16 @@ mod tests {
             grouped_cred("ok-b", &[]),
         ]);
         seed_model_cache(&manager, 1, &["glm-5"]);
-        manager.set_disabled(2, true).unwrap();
+        assert!(manager.report_quota_exhausted(2));
+        assert_eq!(
+            manager
+                .snapshot()
+                .entries
+                .iter()
+                .find(|entry| entry.id == 2)
+                .and_then(|entry| entry.disabled_reason.as_deref()),
+            Some("QuotaExceeded")
+        );
 
         let mut picks = std::collections::HashSet::new();
         for _ in 0..200 {

@@ -176,7 +176,7 @@ pub struct Config {
     #[serde(default = "default_update_auto_apply_time")]
     pub update_auto_apply_time: String,
 
-    /// 负载均衡模式（"priority" 或 "balanced"）
+    /// 负载均衡模式（"priority" 或 "balanced"）。balanced 使用 Kiro-Go 风格轮询。
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
@@ -379,7 +379,7 @@ fn default_upstream_read_timeout_secs() -> u64 {
 }
 
 fn default_load_balancing_mode() -> String {
-    "priority".to_string()
+    "balanced".to_string()
 }
 
 fn default_session_affinity_enabled() -> bool {
@@ -629,8 +629,10 @@ mod tests {
         assert_eq!(config.upstream_connect_timeout_secs, 15);
         assert_eq!(config.upstream_read_timeout_secs, 120);
         assert_eq!(config.upstream_request_timeout_secs, 3600);
+        assert_eq!(config.load_balancing_mode, "balanced");
         assert_eq!(Config::default().upstream_connect_timeout_secs, 15);
         assert_eq!(Config::default().upstream_read_timeout_secs, 120);
+        assert_eq!(Config::default().load_balancing_mode, "balanced");
     }
 
     #[test]

@@ -104,7 +104,7 @@ export function TopbarTools({ compact }: TopbarToolsProps) {
   const onError = (err: unknown) =>
     toast.error('切换失败：' + extractErrorMessage(err))
 
-  const balanced = lbData?.mode === 'balanced'
+  const balanced = lbData?.mode ? lbData.mode === 'balanced' : true
   const failover = throttle?.failover ?? true
   const healing = selfHeal?.enabled ?? true
   const cooldownMin = Math.round((throttle?.cooldownSecs ?? 1800) / 60)
@@ -117,7 +117,7 @@ export function TopbarTools({ compact }: TopbarToolsProps) {
       label: lbLoading ? '加载中…' : balanced ? '均衡负载' : '按优先级',
       menuLabel: balanced ? '切换到按优先级' : '切换到均衡负载',
       title: balanced
-        ? '调度模式：均衡负载 —— 按用量动态摊平到整个池子'
+        ? '调度模式：均衡负载 —— 按可用账号轮询，失败账号自动切换'
         : '调度模式：按优先级 —— 数字越小越先用，用完再换下一个',
       icon: <Activity className="h-3.5 w-3.5" />,
       onToggle: () =>

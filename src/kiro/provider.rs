@@ -29,12 +29,11 @@ use parking_lot::Mutex;
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
-/// 总重试次数硬上限（避免无限重试）
+/// 总重试次数硬上限（避免无限重试）。
 ///
-/// 注：上游 429 多为账号级速率配额（SERVICE_REQUEST_RATE_EXCEEDED），高峰期
-/// 多账号同时触顶时，过多重试会在账号间连环撞墙、放大限流。故上限取较小值，
-/// 配合 429 专用长退避（见 retry_delay_throttle），被限时尽早返回而非耗尽配额。
-const MAX_TOTAL_RETRIES: usize = 4;
+/// Kiro-Go 的一次账号尝试还包含同账号端点回退，因此这里保留 9 次预算，
+/// 允许一个账号走完 OAuth 端点链后再切换凭据；账号级 429 仍会立即冷却并排除。
+const MAX_TOTAL_RETRIES: usize = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelApi429Action {
@@ -221,6 +220,40 @@ impl KiroProvider {
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
     }
 
+    /// Kiro-Go 风格的同账号端点链。API Key 账号固定走 CLI 协议；OAuth
+    /// 账号按凭据声明的端点优先，然后依次尝试 Kiro、CodeWhisperer、Amazon Q。
+    /// 端点回退发生在账号冷却之前，避免把一个端点的 429 误判成账号整体不可用。
+    fn endpoint_candidates(
+        &self,
+        credentials: &KiroCredentials,
+    ) -> anyhow::Result<Vec<Arc<dyn KiroEndpoint>>> {
+        let primary = self.endpoint_for(credentials)?;
+        if credentials.is_api_key_credential() {
+            return Ok(vec![primary]);
+        }
+
+        let mut result = vec![primary.clone()];
+        for name in ["ide", "codewhisperer", "amazonq"] {
+            if name == primary.name() {
+                continue;
+            }
+            if let Some(endpoint) = self.endpoints.get(name) {
+                result.push(endpoint.clone());
+            }
+        }
+        Ok(result)
+    }
+
+    fn next_endpoint_for(
+        &self,
+        credentials: &KiroCredentials,
+        current: &str,
+    ) -> Option<Arc<dyn KiroEndpoint>> {
+        let candidates = self.endpoint_candidates(credentials).ok()?;
+        let index = candidates.iter().position(|endpoint| endpoint.name() == current)?;
+        candidates.into_iter().nth(index + 1)
+    }
+
     /// 在发起请求前，确保 Enterprise / IdC 账号的真实 profileArn 已解析并写入 `ctx`。
     ///
     /// 流式端点强制要求 profileArn；Enterprise / IdC 账号必须先把 BuilderID
@@ -237,7 +270,25 @@ impl KiroProvider {
     ) -> anyhow::Result<()> {
         use crate::kiro::model::credentials::is_placeholder_profile_arn;
 
-        if ctx.credentials.is_api_key_credential() {
+        let enterprise_idc = ctx
+            .credentials
+            .provider
+            .as_deref()
+            .is_some_and(|provider| provider.eq_ignore_ascii_case("enterprise"))
+            && ctx
+                .credentials
+                .auth_method
+                .as_deref()
+                .is_some_and(|method| {
+                    method.eq_ignore_ascii_case("idc")
+                        || method.eq_ignore_ascii_case("external_idp")
+                });
+
+        // Builder ID and social accounts use their fixed profile ARN and must
+        // not call the Enterprise profile endpoint. That endpoint returns 403
+        // for Builder ID, which otherwise consumes retry slots and hides a
+        // healthy Enterprise account behind avoidable failover noise.
+        if ctx.credentials.is_api_key_credential() || !enterprise_idc {
             return Ok(());
         }
         let needs = match ctx.credentials.profile_arn.as_deref() {
@@ -388,45 +439,70 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        // Keep failed credentials out of this request's retry cycle. Kiro-Go uses
+        // the same request-local exclusion rule; global availability is preserved
+        // so a later request can use a recovered account.
+        let mut excluded_credentials: HashSet<u64> = HashSet::new();
+        let mut pending_endpoint: Option<(
+            crate::kiro::token_manager::CallContext,
+            Arc<dyn KiroEndpoint>,
+        )> = None;
 
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // MCP 调用不涉及模型选择，但必须遵守客户端 Key 的凭据分组隔离。
-            let mut ctx = match self.token_manager.acquire_context(None, group).await {
-                Ok(c) => c,
-                Err(e) => {
-                    if is_rate_limit_error(&e) {
+            let (mut ctx, pending_endpoint_for_attempt) = if let Some((ctx, endpoint)) = pending_endpoint.take() {
+                (ctx, Some(endpoint))
+            } else {
+                let ctx = match self
+                    .token_manager
+                    .acquire_context_routed_excluding(None, group, None, &excluded_credentials)
+                    .await
+                {
+                    Ok((c, _route)) => c,
+                    Err(e) => {
+                        if is_rate_limit_error(&e) {
+                            Self::emit_attempt(
+                                sink,
+                                attempt,
+                                0,
+                                "",
+                                None,
+                                outcome::TRANSIENT,
+                                Some(&e.to_string()),
+                                attempt_start,
+                            );
+                            return Err(e);
+                        }
+                        // Preserve the prior upstream 429 as the terminal trace attempt. A
+                        // concurrent selection failure has no credential to attribute.
+                        if let Some(rate_limit) = take_rate_limit_error(&mut last_error) {
+                            return Err(rate_limit);
+                        }
                         Self::emit_attempt(
                             sink,
                             attempt,
                             0,
                             "",
                             None,
-                            outcome::TRANSIENT,
+                            outcome::UNKNOWN,
                             Some(&e.to_string()),
                             attempt_start,
                         );
-                        return Err(e);
+                        last_error = Some(e);
+                        continue;
                     }
-                    // Preserve the prior upstream 429 as the terminal trace attempt. A
-                    // concurrent selection failure has no credential to attribute.
-                    if let Some(rate_limit) = take_rate_limit_error(&mut last_error) {
-                        return Err(rate_limit);
-                    }
-                    Self::emit_attempt(
-                        sink,
-                        attempt,
-                        0,
-                        "",
-                        None,
-                        outcome::UNKNOWN,
-                        Some(&e.to_string()),
-                        attempt_start,
-                    );
-                    last_error = Some(e);
-                    continue;
-                }
+                };
+                (ctx, None)
             };
+
+            // 账号可能在选号后被并发请求禁用；禁用账号不得继续解析 profile
+            // 或执行后续上游调用。
+            if !self.token_manager.is_credential_enabled(ctx.id) {
+                excluded_credentials.insert(ctx.id);
+                last_error = Some(anyhow::anyhow!("凭据已被禁用"));
+                continue;
+            }
 
             // Pure MCP routes (including Web Search) require the same Enterprise / IdC
             // profileArn resolution as regular model calls.
@@ -441,14 +517,18 @@ impl KiroProvider {
                     Some(&e.to_string()),
                     attempt_start,
                 );
-                return Err(e);
+                excluded_credentials.insert(ctx.id);
+                last_error = Some(e);
+                continue;
             }
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
 
-            let endpoint = match self.endpoint_for(&ctx.credentials) {
-                Ok(e) => e,
+            let endpoint = match pending_endpoint_for_attempt {
+                Some(endpoint) => endpoint,
+                None => match self.endpoint_for(&ctx.credentials) {
+                    Ok(e) => e,
                 Err(e) => {
                     Self::emit_attempt(
                         sink,
@@ -461,11 +541,13 @@ impl KiroProvider {
                         attempt_start,
                     );
                     last_error = Some(e);
+                    excluded_credentials.insert(ctx.id);
                     // endpoint 解析失败：记为失败，换下一张凭据
                     self.token_manager
                         .report_failure_for_request(ctx.id, None, group);
                     continue;
                 }
+                },
             };
             let endpoint_name = endpoint.name();
 
@@ -494,7 +576,9 @@ impl KiroProvider {
                         Some(&e.to_string()),
                         attempt_start,
                     );
-                    return Err(e);
+                    excluded_credentials.insert(ctx.id);
+                    last_error = Some(e);
+                    continue;
                 }
             };
             let base = client
@@ -504,6 +588,7 @@ impl KiroProvider {
             let request = endpoint.decorate_mcp(base, &rctx);
 
             let Some(permit) = self.token_manager.try_acquire_permit(ctx.id) else {
+                excluded_credentials.insert(ctx.id);
                 last_error = Some(UpstreamRateLimitError::new(Some("1".to_string())).into());
                 continue;
             };
@@ -517,6 +602,27 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
+                    if let Some(next_endpoint) = self.next_endpoint_for(&ctx.credentials, endpoint_name) {
+                        tracing::warn!(
+                            "MCP 网络错误，凭据 #{} 从端点 [{}] 回退到 [{}]",
+                            ctx.id,
+                            endpoint_name,
+                            next_endpoint.name()
+                        );
+                        Self::emit_attempt(
+                            sink,
+                            attempt,
+                            ctx.id,
+                            endpoint_name,
+                            None,
+                            outcome::NETWORK_ERROR,
+                            Some(&e.to_string()),
+                            attempt_start,
+                        );
+                        pending_endpoint = Some((ctx.clone(), next_endpoint));
+                        last_error = Some(e.into());
+                        continue;
+                    }
                     Self::emit_attempt(
                         sink,
                         attempt,
@@ -537,6 +643,7 @@ impl KiroProvider {
                         tracing::warn!("凭据 #{} 有专属代理且 MCP 请求失败，跳过该凭据", ctx.id);
                         self.token_manager
                             .report_failure_for_request(ctx.id, None, group);
+                        excluded_credentials.insert(ctx.id);
                     }
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
@@ -580,6 +687,7 @@ impl KiroProvider {
                 let has_available = self
                     .token_manager
                     .report_quota_exhausted_for_request(ctx.id, None, group);
+                excluded_credentials.insert(ctx.id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
@@ -622,6 +730,7 @@ impl KiroProvider {
                     let has_available = self
                         .token_manager
                         .report_suspended_for_request(ctx.id, None, group);
+                    excluded_credentials.insert(ctx.id);
                     if !has_available {
                         return Err(UpstreamCredentialError::from_response(status.as_u16(), &body).unwrap().into());
                     }
@@ -656,11 +765,34 @@ impl KiroProvider {
                 let has_available = self
                     .token_manager
                     .report_failure_for_request(ctx.id, None, group);
+                excluded_credentials.insert(ctx.id);
                 if !has_available {
                     return Err(UpstreamCredentialError::from_response(status.as_u16(), &body).unwrap().into());
                 }
                 last_error = Some(UpstreamCredentialError::from_response(status.as_u16(), &body).unwrap().into());
                 continue;
+            }
+
+            // 与 API 请求一致：先在同一账号内回退到下一个上游端点，
+            // 再把账号标记为冷却，避免单端点 429 放大为账号故障。
+            if status.as_u16() == 429 {
+                if let Some(next_endpoint) = self.next_endpoint_for(&ctx.credentials, endpoint_name) {
+                    Self::emit_attempt(
+                        sink,
+                        attempt,
+                        ctx.id,
+                        endpoint_name,
+                        Some(429),
+                        outcome::TRANSIENT,
+                        Some(&body),
+                        attempt_start,
+                    );
+                    last_error = Some(rate_limit_error
+                        .unwrap_or_else(|| UpstreamRateLimitError::new(None))
+                        .into());
+                    pending_endpoint = Some((ctx.clone(), next_endpoint));
+                    continue;
+                }
             }
 
             // 瞬态错误
@@ -758,11 +890,25 @@ impl KiroProvider {
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
+        // Keep failed credentials out of this request's retry cycle. Kiro-Go uses
+        // the same request-local exclusion rule; global availability is preserved
+        // so a later request can use a recovered account.
+        let mut excluded_credentials: HashSet<u64> = HashSet::new();
+        let mut pending_endpoint: Option<(
+            crate::kiro::token_manager::CallContext,
+            Arc<dyn KiroEndpoint>,
+        )> = None;
 
         // 尝试从请求体中提取模型与会话标识
         let (model, session_id) = Self::extract_routing_hints(request_body);
+        // Route against the same canonical model ID that the converter sends to Kiro.
+        // Anthropic clients commonly use dated IDs such as
+        // `claude-sonnet-4-5-20250929`, while ListAvailableModels returns
+        // `claude-sonnet-4.5`. Comparing the raw request ID against that cache
+        // incorrectly removes valid accounts (including POWER) from the pool.
+        let routing_model = normalize_routing_model(model.as_deref());
 
-        if let Some(model) = model.as_ref() {
+        if let Some(model) = routing_model.as_ref() {
             let now = Instant::now();
             let mut cooldowns = self.model_cooldowns.lock();
             cooldowns.retain(|_, until| *until > now);
@@ -779,45 +925,63 @@ impl KiroProvider {
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）；同一会话优先沿用上一轮凭据
-            let mut ctx = match self
-                .token_manager
-                .acquire_context_routed(model.as_deref(), group, session_id.as_deref())
-                .await
-            {
-                Ok((c, route)) => {
-                    // 只在首次选号时计入命中率并上报 trace；重试轮次的判定受本请求内
-                    // 刚发生的失败影响，不代表会话层面的粘性效果。
-                    if attempt == 0 {
-                        self.token_manager.record_route(&route);
-                        if let Some(sink) = sink {
-                            sink.on_route(TraceRoute {
-                                session_id: session_id.clone(),
-                                sticky_outcome: route.sticky_outcome.as_str(),
-                                previous_credential_id: route.previous_credential_id,
-                            });
+            let (mut ctx, pending_endpoint_for_attempt) = if let Some((ctx, endpoint)) = pending_endpoint.take() {
+                (ctx, Some(endpoint))
+            } else {
+                let ctx = match self
+                    .token_manager
+                    .acquire_context_routed_excluding(
+                        routing_model.as_deref(),
+                        group,
+                        session_id.as_deref(),
+                        &excluded_credentials,
+                    )
+                    .await
+                {
+                    Ok((c, route)) => {
+                        // 只在首次选号时计入命中率并上报 trace；重试轮次的判定受本请求内
+                        // 刚发生的失败影响，不代表会话层面的粘性效果。
+                        if attempt == 0 {
+                            self.token_manager.record_route(&route);
+                            if let Some(sink) = sink {
+                                sink.on_route(TraceRoute {
+                                    session_id: session_id.clone(),
+                                    sticky_outcome: route.sticky_outcome.as_str(),
+                                    previous_credential_id: route.previous_credential_id,
+                                });
+                            }
                         }
+                        c
                     }
-                    c
-                }
-                Err(e) => {
-                    if is_rate_limit_error(&e) {
+                    Err(e) => {
+                        if is_rate_limit_error(&e) {
+                            Self::emit_attempt(
+                                sink, attempt, 0, "", None, outcome::TRANSIENT,
+                                Some(&e.to_string()), attempt_start,
+                            );
+                            return Err(e);
+                        }
+                        if let Some(rate_limit) = take_rate_limit_error(&mut last_error) {
+                            return Err(rate_limit);
+                        }
                         Self::emit_attempt(
-                            sink, attempt, 0, "", None, outcome::TRANSIENT,
+                            sink, attempt, 0, "", None, outcome::UNKNOWN,
                             Some(&e.to_string()), attempt_start,
                         );
-                        return Err(e);
+                        last_error = Some(e);
+                        continue;
                     }
-                    if let Some(rate_limit) = take_rate_limit_error(&mut last_error) {
-                        return Err(rate_limit);
-                    }
-                    Self::emit_attempt(
-                        sink, attempt, 0, "", None, outcome::UNKNOWN,
-                        Some(&e.to_string()), attempt_start,
-                    );
-                    last_error = Some(e);
-                    continue;
-                }
+                };
+                (ctx, None)
             };
+
+            // 账号可能在选号后被并发请求禁用；禁用账号不得继续解析 profile
+            // 或执行后续上游调用。
+            if !self.token_manager.is_credential_enabled(ctx.id) {
+                excluded_credentials.insert(ctx.id);
+                last_error = Some(anyhow::anyhow!("凭据已被禁用"));
+                continue;
+            }
 
             // 确保 Enterprise / IdC 账号的真实 profileArn 已解析（流式端点强制要求）
             if let Err(e) = self.ensure_profile_arn(&mut ctx).await {
@@ -831,24 +995,30 @@ impl KiroProvider {
                     Some(&e.to_string()),
                     attempt_start,
                 );
-                return Err(e);
+                excluded_credentials.insert(ctx.id);
+                last_error = Some(e);
+                continue;
             }
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
 
-            let endpoint = match self.endpoint_for(&ctx.credentials) {
-                Ok(e) => e,
+            let endpoint = match pending_endpoint_for_attempt {
+                Some(endpoint) => endpoint,
+                None => match self.endpoint_for(&ctx.credentials) {
+                    Ok(e) => e,
                 Err(e) => {
                     Self::emit_attempt(
                         sink, attempt, ctx.id, "", None, outcome::UNKNOWN,
                         Some(&e.to_string()), attempt_start,
                     );
                     last_error = Some(e);
+                    excluded_credentials.insert(ctx.id);
                     self.token_manager
-                        .report_failure_for_request(ctx.id, model.as_deref(), group);
+                        .report_failure_for_request(ctx.id, routing_model.as_deref(), group);
                     continue;
                 }
+                },
             };
             let endpoint_name = endpoint.name();
 
@@ -867,7 +1037,14 @@ impl KiroProvider {
 
             let effective_proxy = ctx.credentials.effective_proxy(self.global_proxy.as_ref());
             let proxy_use = self.token_manager.prepare_proxy_use(&ctx.credentials, effective_proxy.as_ref()).await?;
-            let client = self.client_for_proxy(proxy_use.proxy().cloned())?;
+            let client = match self.client_for_proxy(proxy_use.proxy().cloned()) {
+                Ok(client) => client,
+                Err(error) => {
+                    excluded_credentials.insert(ctx.id);
+                    last_error = Some(error);
+                    continue;
+                }
+            };
             let base = client.post(&url)
                 .body(body)
                 .header("content-type", endpoint.content_type());
@@ -881,6 +1058,7 @@ impl KiroProvider {
                 }
             }
             let Some(permit) = self.token_manager.try_acquire_permit(ctx.id) else {
+                excluded_credentials.insert(ctx.id);
                 last_error = Some(UpstreamRateLimitError::new(Some("1".to_string())).into());
                 continue;
             };
@@ -894,6 +1072,27 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
+                    if let Some(next_endpoint) = self.next_endpoint_for(&ctx.credentials, endpoint_name) {
+                        tracing::warn!(
+                            "API 网络错误，凭据 #{} 从端点 [{}] 回退到 [{}]",
+                            ctx.id,
+                            endpoint_name,
+                            next_endpoint.name()
+                        );
+                        Self::emit_attempt(
+                            sink,
+                            attempt,
+                            ctx.id,
+                            endpoint_name,
+                            None,
+                            outcome::NETWORK_ERROR,
+                            Some(&e.to_string()),
+                            attempt_start,
+                        );
+                        pending_endpoint = Some((ctx.clone(), next_endpoint));
+                        last_error = Some(e.into());
+                        continue;
+                    }
                     Self::emit_attempt(
                         sink, attempt, ctx.id, endpoint_name, None,
                         outcome::NETWORK_ERROR, Some(&e.to_string()), attempt_start,
@@ -911,9 +1110,9 @@ impl KiroProvider {
                             ctx.id
                         );
                         self.token_manager
-                            .report_failure_for_request(ctx.id, model.as_deref(), group);
+                            .report_failure_for_request(ctx.id, routing_model.as_deref(), group);
+                        excluded_credentials.insert(ctx.id);
                     }
-
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
@@ -933,7 +1132,7 @@ impl KiroProvider {
                     outcome::SUCCESS, None, attempt_start,
                 );
                 self.token_manager
-                    .report_success_for_request(ctx.id, model.as_deref());
+                    .report_success_for_request(ctx.id, routing_model.as_deref());
                 // 上游接受了请求才把会话钉到这个凭据，失败的凭据不会被绑定
                 if let Some(session) = session_id.as_deref() {
                     self.token_manager.bind_session(session, ctx.id);
@@ -1025,9 +1224,10 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_quota_exhausted_for_request(
                     ctx.id,
-                    model.as_deref(),
+                    routing_model.as_deref(),
                     group,
                 );
+                excluded_credentials.insert(ctx.id);
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
@@ -1080,9 +1280,10 @@ impl KiroProvider {
 
                     let has_available = self.token_manager.report_suspended_for_request(
                         ctx.id,
-                        model.as_deref(),
+                        routing_model.as_deref(),
                         group,
                     );
+                    excluded_credentials.insert(ctx.id);
                     if !has_available {
                         return Err(UpstreamCredentialError::from_response(status.as_u16(), &body).unwrap().into());
                     }
@@ -1117,7 +1318,8 @@ impl KiroProvider {
 
                 let has_available =
                     self.token_manager
-                        .report_failure_for_request(ctx.id, model.as_deref(), group);
+                        .report_failure_for_request(ctx.id, routing_model.as_deref(), group);
+                excluded_credentials.insert(ctx.id);
                 if !has_available {
                     return Err(UpstreamCredentialError::from_response(status.as_u16(), &body).unwrap().into());
                 }
@@ -1127,6 +1329,27 @@ impl KiroProvider {
             }
 
             if status.as_u16() == 429 {
+                // Try the next upstream endpoint for the same account before
+                // cooling that account. This is the Kiro-Go recovery order and
+                // is especially important when only one data-plane endpoint
+                // is rate limited.
+                if let Some(next_endpoint) = self.next_endpoint_for(&ctx.credentials, endpoint_name) {
+                    tracing::warn!(
+                        "API 429，凭据 #{} 从端点 [{}] 回退到 [{}]",
+                        ctx.id,
+                        endpoint_name,
+                        next_endpoint.name()
+                    );
+                    Self::emit_attempt(
+                        sink, attempt, ctx.id, endpoint_name, Some(429),
+                        outcome::TRANSIENT, Some(&body), attempt_start,
+                    );
+                    last_error = Some(rate_limit_error
+                        .unwrap_or_else(|| UpstreamRateLimitError::new(None))
+                        .into());
+                    pending_endpoint = Some((ctx.clone(), next_endpoint));
+                    continue;
+                }
                 let account_rate_limited = endpoint.is_account_rate_limited(&body);
                 match model_api_429_action(
                     account_rate_limited,
@@ -1153,9 +1376,10 @@ impl KiroProvider {
                             .report_account_throttled_for_request(
                                 ctx.id,
                                 cooldown,
-                                model.as_deref(),
+                                routing_model.as_deref(),
                                 group,
                             );
+                        excluded_credentials.insert(ctx.id);
                         Self::emit_attempt(
                             sink, attempt, ctx.id, endpoint_name, Some(429),
                             outcome::ACCOUNT_THROTTLED, Some(&body), attempt_start,
@@ -1411,6 +1635,10 @@ fn is_rate_limit_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<UpstreamRateLimitError>().is_some()
 }
 
+fn normalize_routing_model(model: Option<&str>) -> Option<String> {
+    model.and_then(crate::anthropic::converter::map_model)
+}
+
 fn take_rate_limit_error(last_error: &mut Option<anyhow::Error>) -> Option<anyhow::Error> {
     if last_error
         .as_ref()
@@ -1454,6 +1682,19 @@ fn account_rate_limit_with_fallback(
 #[cfg(test)]
 mod rate_limit_tests {
     use super::*;
+
+    #[test]
+    fn routing_normalizes_anthropic_dated_model_ids() {
+        assert_eq!(
+            normalize_routing_model(Some("claude-sonnet-4-5-20250929")).as_deref(),
+            Some("claude-sonnet-4.5")
+        );
+        assert_eq!(
+            normalize_routing_model(Some("claude-sonnet-4.5-thinking")).as_deref(),
+            Some("claude-sonnet-4.5")
+        );
+        assert_eq!(normalize_routing_model(Some("custom-model")).as_deref(), Some("custom-model"));
+    }
 
     #[test]
     fn mcp_validation_treats_caller_accepted_errors_as_success() {

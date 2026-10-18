@@ -46,10 +46,10 @@ Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
 - 流式和非流式响应：支持 Anthropic SSE 与 OpenAI SSE 事件格式。
 - **多凭据管理**：OAuth、Builder ID、Social、Enterprise / IdC、企业 SSO（Microsoft Entra ID / Azure AD）、Kiro API Key。
 - 自动 token 刷新：支持刷新后回写 `credentials.json`。
-- **多凭据调度**：`priority` 固定优先级和 `balanced` 均衡分配。
+- **多凭据调度**：`balanced` 使用 Kiro-Go 风格轮询，`priority` 保留固定优先级模式。
 - **故障转移**：凭据失败、额度用尽、账号级 429 限流冷却、token 失效强制刷新。
 - **profileArn 策略**：流式端点按账号类型注入真实 ARN 或 Builder ID 占位 ARN；用量类 / 头部类调用跳过占位 ARN。
-- **端点抽象**：按凭据选择 `ide` 或 `cli` endpoint。
+- **端点抽象**：API Key 凭据使用 `cli`；OAuth 凭据支持 `ide`、`codewhisperer`、`amazonq`，429 时按 Kiro-Go 风格在同账号端点间回退后再切换账号。
 - **工具调用**：支持 `tool_use` / `tool_result` 配对、工具名缩短与反向映射。
 - **Thinking / Reasoning 兼容**：支持 `thinking.type=enabled` / `adaptive`、Claude Code 默认 thinking 请求、Kiro 原生 `reasoningContentEvent` 到 Anthropic thinking / signature / redacted thinking 事件的转换。
 - **WebSearch**：支持纯 `web_search` 请求和混合工具场景下的本地 agentic web_search loop。
@@ -365,7 +365,7 @@ Admin API 鉴权同样支持：
 | `tlsBackend` | `rustls` | `rustls` 或 `native-tls` |
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
-| `loadBalancingMode` | `priority` | `priority` 或 `balanced` |
+| `loadBalancingMode` | `balanced` | `priority` 或 `balanced` |
 | `accountThrottleFailover` | `true` | 账号级 429 是否冷却并切换凭据；覆盖 USER/CREDIT 请求限流和 suspicious activity |
 | `accountThrottleCooldownSecs` | `1800` | 账号级 429 限流冷却秒数 |
 | `modelApi429RetryEnabled` | `true` | 无需换号的容量类模型 API 429 是否由中转自动重试 |
@@ -513,7 +513,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 | `proxyUsername` / `proxyPassword` | 凭据级代理认证 |
 | `disabled` | 是否禁用 |
 | `kiroApiKey` | `ksk_*` Kiro API Key |
-| `endpoint` | `ide` 或 `cli`，未填使用 `config.defaultEndpoint` |
+| `endpoint` | `ide`、`codewhisperer`、`amazonq` 或 `cli`，未填使用 `config.defaultEndpoint` |
 
 <a id="models"></a>
 ## 模型
@@ -781,8 +781,8 @@ credential.proxyUrl -> config.proxyUrl -> direct
 
 `loadBalancingMode` 支持：
 
-- `priority`：优先使用 priority 数字最小的可用凭据。
-- `balanced`：在可用凭据之间均衡分配。
+- `priority`：按优先级选择可用凭据；同一优先级内轮转，避免账号饥饿。
+- `balanced`：按 Kiro-Go 风格在当前可用凭据之间加权轮询；容量更大的账号获得更多机会，失败、禁用、冷却和超额账号会暂时跳过。
 
 故障处理：
 
@@ -790,6 +790,7 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 402 / quota exhausted 会禁用该凭据并切换。
 - 401 / 403 中识别到 bearer token 失效时，会对该凭据强制刷新一次 token 后重试。
 - USER/CREDIT 请求限流和 suspicious activity 429 可触发账号级冷却并切换凭据。
+- OAuth 账号遇到 429 或端点网络错误时，会先在 Kiro、CodeWhisperer、Amazon Q 端点间回退，再冷却账号。
 - `INSUFFICIENT_MODEL_CAPACITY` 等容量类 429 不切换凭据，可配置是否在当前凭据上退避重试。
 - 400 客户端请求错误不会切换凭据。
 - 网关超时和部分不可恢复错误会快速失败，避免一次请求内无限放大重试。
