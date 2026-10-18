@@ -41,7 +41,7 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::session_affinity::{RouteDecision, SessionAffinity, StickyOutcome};
-use crate::model::config::Config;
+use crate::model::config::{ACCOUNT_THROTTLE_COOLDOWN_SECS, Config};
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -1295,7 +1295,7 @@ pub struct MultiTokenManager {
     session_affinity: SessionAffinity,
     /// 账号级 429 限流故障转移开关（运行时可修改）
     account_throttle_failover: AtomicBool,
-    /// 账号级 429 限流冷却时长（秒，运行时可修改）
+    /// 账号级 429 限流冷却时长（固定 60 秒）
     account_throttle_cooldown_secs: AtomicU64,
     /// 普通模型 API 429 自动重试开关（运行时可修改）
     model_api_429_retry_enabled: AtomicBool,
@@ -1558,7 +1558,8 @@ impl MultiTokenManager {
             config.session_affinity_ttl_secs,
         );
         let throttle_failover = config.account_throttle_failover;
-        let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        // 忽略旧配置或自定义值，账号级限流始终使用短冷却。
+        let throttle_cooldown_secs = ACCOUNT_THROTTLE_COOLDOWN_SECS;
         let model_api_429_retry_enabled = config.model_api_429_retry_enabled;
         let rpm_limit_enabled = config.account_rpm_limit_enabled;
         let rpm_limit = config.account_rpm_limit;
@@ -3864,7 +3865,7 @@ impl MultiTokenManager {
     /// 标记凭据进入临时冷却期（账号级 429 限流触发）
     ///
     /// 与 `report_failure` 不同：不计入永久禁用，到期自动恢复。账号级限流时
-    /// 当前凭据先冷却 N 分钟，再故障转移到其它凭据。
+    /// 当前凭据先冷却 60 秒，再故障转移到其它凭据。
     ///
     /// 标记凭据冷却，并在同一锁临界区内返回当前请求范围的剩余凭据数。
     pub fn report_account_throttled_for_request(
@@ -5172,9 +5173,12 @@ impl MultiTokenManager {
         cooldown_secs: Option<u64>,
     ) -> anyhow::Result<()> {
         if let Some(secs) = cooldown_secs {
-            // 限定一个合理范围：1 秒到 24 小时
-            if !(1..=86_400).contains(&secs) {
-                anyhow::bail!("冷却时长必须在 1..=86400 秒内: {}", secs);
+            if secs != ACCOUNT_THROTTLE_COOLDOWN_SECS {
+                anyhow::bail!(
+                    "账号级限流冷却固定为 {} 秒，不允许设置为 {} 秒",
+                    ACCOUNT_THROTTLE_COOLDOWN_SECS,
+                    secs
+                );
             }
         }
 
@@ -5183,7 +5187,7 @@ impl MultiTokenManager {
         let prev_failover = self.get_account_throttle_failover();
         let prev_cooldown = self.get_account_throttle_cooldown_secs();
         let new_failover = failover.unwrap_or(prev_failover);
-        let new_cooldown = cooldown_secs.unwrap_or(prev_cooldown);
+        let new_cooldown = ACCOUNT_THROTTLE_COOLDOWN_SECS;
 
         if new_failover == prev_failover && new_cooldown == prev_cooldown {
             return Ok(());
@@ -8818,6 +8822,22 @@ mod tests {
             Some(2)
         );
         assert_eq!(manager.snapshot().available, 1);
+    }
+
+    #[test]
+    fn account_throttle_cooldown_is_fixed_to_sixty_seconds() {
+        let manager = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+
+        assert_eq!(
+            manager.get_account_throttle_cooldown_secs(),
+            ACCOUNT_THROTTLE_COOLDOWN_SECS
+        );
+        assert!(manager
+            .set_account_throttle_config(None, Some(1800))
+            .is_err());
+        assert!(manager
+            .set_account_throttle_config(None, Some(ACCOUNT_THROTTLE_COOLDOWN_SECS))
+            .is_ok());
     }
 
     #[test]

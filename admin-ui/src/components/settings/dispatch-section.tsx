@@ -82,7 +82,6 @@ function RateLimitHandlingGroup() {
   const { mutate: setRetry } = useSetModelApiRetryConfig()
   const retrySaver = useFieldSaver(setRetry, reportSaveError)
   const failover = throttle?.failover ?? true
-  const cooldownSecs = throttle?.cooldownSecs ?? 30 * SECS_PER_MIN
   const retryEnabled = retry?.enabled ?? true
 
   return (
@@ -103,23 +102,12 @@ function RateLimitHandlingGroup() {
         saved={throttleSaver.isSaved('failover')}
         disabled={throttleLoading}
       />
-      <SettingNumber
+      <SettingReadout
         label="账号冷却时长"
-        hint="被账号级限流的凭据要静默多久才重新参与调度"
-        value={cooldownSecs}
-        toDisplay={(secs) => Math.round(secs / SECS_PER_MIN)}
-        fromDisplay={(min) => min * SECS_PER_MIN}
-        onCommit={(secs) =>
-          throttleSaver.save('cooldown', { cooldownSecs: secs })
-        }
-        min={1}
-        max={1440}
-        unit="分钟"
-        presets={[5, 15, 30, 60]}
-        pending={throttleSaver.isSaving('cooldown')}
-        saved={throttleSaver.isSaved('cooldown')}
-        disabled={throttleLoading || !failover}
-      />
+        hint="账号级限流固定冷却 60 秒，恢复后自动重新参与调度"
+      >
+        1 分钟
+      </SettingReadout>
       <SettingSwitch
         label="普通 429 自动重试"
         hint={

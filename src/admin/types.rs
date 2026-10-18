@@ -508,7 +508,7 @@ pub struct SetLoadBalancingModeRequest {
 pub struct AccountThrottleConfigResponse {
     /// 是否在账号级 429 时冷却并切换凭据
     pub failover: bool,
-    /// 冷却时长（秒）
+    /// 固定为 60 秒的冷却时长
     pub cooldown_secs: u64,
 }
 
@@ -519,7 +519,7 @@ pub struct SetAccountThrottleConfigRequest {
     /// 是否按需切换凭据；缺省表示不修改
     #[serde(default)]
     pub failover: Option<bool>,
-    /// 冷却时长（秒）；缺省表示不修改，1..=86400
+    /// 冷却时长（秒）；仅接受 60，缺省表示不修改
     #[serde(default)]
     pub cooldown_secs: Option<u64>,
 }

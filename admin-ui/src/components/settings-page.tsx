@@ -28,7 +28,7 @@ import { ModelsSection } from '@/components/settings/models-section'
  * 镜像更新弹窗内（更新配置）。同一类东西分在六个地方，找一个配置得先记住它藏在哪。
  *
  * 顶栏**保留**三个快捷开关（负载均衡 / 故障转移 / 自愈），因为它们是运维高频动作，
- * 一次点击就该切换完；但参数（冷却时长、连续上限、保留天数这些）全部移到这里 ——
+ * 一次点击就该切换完；但参数（连续上限、保留天数这些）全部移到这里 ——
  * 下拉菜单里塞数字输入框本来就不是它该干的事。
  */
 type SectionKey = 'dispatch' | 'metadata' | 'network' | 'log' | 'models' | 'system' | 'security'

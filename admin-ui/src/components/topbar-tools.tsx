@@ -36,7 +36,7 @@ import { AvailableModelsDialog } from '@/components/available-models-dialog'
 /**
  * 顶栏工具区：三个调度开关 + 三个动作按钮。
  *
- * 这里此前塞了完整的配置面板 —— 冷却时长的 5 个预设按钮、自定义分钟输入、自愈连续
+ * 这里此前塞了完整的配置面板 —— 自愈连续
  * 上限输入、登录密钥表单，还各写了 compact / full 两套。下拉菜单里放数字输入框本来
  * 就不是它该干的事：菜单是"选一个动作"的容器，不是表单容器。
  *
@@ -107,7 +107,7 @@ export function TopbarTools({ compact }: TopbarToolsProps) {
   const balanced = lbData?.mode ? lbData.mode === 'balanced' : true
   const failover = throttle?.failover ?? true
   const healing = selfHeal?.enabled ?? true
-  const cooldownMin = Math.round((throttle?.cooldownSecs ?? 1800) / 60)
+  const cooldownMin = Math.round((throttle?.cooldownSecs ?? 60) / 60)
 
   const toggles: ToggleSpec[] = [
     {
@@ -136,7 +136,7 @@ export function TopbarTools({ compact }: TopbarToolsProps) {
       label: thLoading ? '加载中…' : failover ? `故障转移 · ${cooldownMin}m` : '不切换',
       menuLabel: failover ? '关闭故障转移' : '开启故障转移',
       title: failover
-        ? `账号级 429 故障转移：开启（冷却 ${cooldownMin} 分钟，可在设置页调整）`
+        ? `账号级 429 故障转移：开启（固定冷却 ${cooldownMin} 分钟）`
         : '账号级 429 故障转移：关闭',
       icon: failover ? (
         <ShieldCheck className="h-3.5 w-3.5 text-emerald-600" />

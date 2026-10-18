@@ -367,7 +367,7 @@ Admin API 鉴权同样支持：
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
 | `loadBalancingMode` | `balanced` | `priority` 或 `balanced` |
 | `accountThrottleFailover` | `true` | 账号级 429 是否冷却并切换凭据；覆盖 USER/CREDIT 请求限流和 suspicious activity |
-| `accountThrottleCooldownSecs` | `1800` | 账号级 429 限流冷却秒数 |
+| `accountThrottleCooldownSecs` | `60` | 账号级 429 限流固定冷却秒数 |
 | `modelApi429RetryEnabled` | `true` | 无需换号的容量类模型 API 429 是否由中转自动重试 |
 | `suspendedDetectionEnabled` | `true` | 是否识别 403 账号封禁文案（`suspended` + `locked your account`）并立即禁用该凭据、不参与自愈 |
 | `selfHealEnabled` | `true` | 全部凭据被自动禁用时是否重置失败计数并重新启用（自愈） |

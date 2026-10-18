@@ -4,6 +4,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// 账号级 429 限流固定冷却时长。
+pub const ACCOUNT_THROTTLE_COOLDOWN_SECS: u64 = 60;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsBackend {
@@ -203,7 +206,7 @@ pub struct Config {
     #[serde(default = "default_account_throttle_failover")]
     pub account_throttle_failover: bool,
 
-    /// 账号级 429 限流冷却时长（秒，默认 1800 = 30 分钟）。
+    /// 账号级 429 限流冷却时长（固定 60 秒）。
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
@@ -395,7 +398,7 @@ fn default_account_throttle_failover() -> bool {
 }
 
 fn default_account_throttle_cooldown_secs() -> u64 {
-    30 * 60
+    ACCOUNT_THROTTLE_COOLDOWN_SECS
 }
 
 fn default_model_api_429_retry_enabled() -> bool {
@@ -548,6 +551,8 @@ impl Config {
         let content = fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
         config.config_path = Some(path.to_path_buf());
+        // 旧配置可能保存了长冷却值；账号级限流现在固定使用 60 秒。
+        config.account_throttle_cooldown_secs = ACCOUNT_THROTTLE_COOLDOWN_SECS;
 
         // 用户手工把字符串字段清空（如 `"updateAutoApplyTime": ""`）时，serde 默认值不会
         // 介入；这里把"看起来像空"的关键字段回退到默认值，避免后续业务用到
@@ -581,6 +586,7 @@ impl Config {
         let text = fs::read_to_string(path).context("读取流量策略配置失败")?;
         let mut config: Self = serde_json::from_str(&text).context("解析流量策略配置失败")?;
         config.config_path = Some(path.to_path_buf());
+        config.account_throttle_cooldown_secs = ACCOUNT_THROTTLE_COOLDOWN_SECS;
         Ok(config)
     }
 
@@ -715,6 +721,13 @@ mod tests {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert!(config.model_api_429_retry_enabled);
         assert!(Config::default().model_api_429_retry_enabled);
+    }
+
+    #[test]
+    fn account_throttle_cooldown_is_fixed_to_one_minute_by_default() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.account_throttle_cooldown_secs, 60);
+        assert_eq!(Config::default().account_throttle_cooldown_secs, 60);
     }
 
     #[test]
