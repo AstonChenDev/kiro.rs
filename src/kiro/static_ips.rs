@@ -500,13 +500,22 @@ impl MultiTokenManager {
         Ok(())
     }
     pub fn static_ip_delete(&self, id: u64) -> anyhow::Result<()> {
+        self.static_ips_delete(&[id])
+    }
+    pub fn static_ips_delete(&self, ids: &[u64]) -> anyhow::Result<()> {
+        if ids.is_empty() { return Err(invalid("请先选择要删除的静态 IP")); }
+        let ids: HashSet<_> = ids.iter().copied().collect();
         let mut store = self.static_ips.lock(); let mut next = store.inventory.clone();
-        let e = next.entries.iter().find(|e| e.id==id).ok_or_else(|| invalid("静态 IP 不存在"))?;
-        let key = endpoint_key(&e.url).unwrap();
-        if !self.static_users(&key).is_empty() || store.reserved.contains(&key) || self.static_is_global(&key) {
-            return Err(invalid("静态 IP 已被占用或正在分配，不能删除；请先解除账号绑定"));
+        // Validate every selected entry under the allocation lock before one atomic save.
+        for id in &ids {
+            let e = next.entries.iter().find(|e| e.id==*id)
+                .ok_or_else(|| invalid(&format!("静态 IP #{id} 不存在，本次未删除任何条目")))?;
+            let key = endpoint_key(&e.url).unwrap();
+            if !self.static_users(&key).is_empty() || store.reserved.contains(&key) || self.static_is_global(&key) {
+                return Err(invalid(&format!("静态 IP #{id} 已被占用或正在分配，不能删除；请先解除账号绑定，本次未删除任何条目")));
+            }
         }
-        next.entries.retain(|e| e.id!=id); store.save(next)
+        next.entries.retain(|e| !ids.contains(&e.id)); store.save(next)
     }
     /// Select the post-import policy; callers must initialize account metadata first.
     /// Explicit ordinary proxies/direct and non-personal identities retain their import path.
@@ -893,6 +902,47 @@ mod tests {
         let mut duplicate=input("192.0.2.10");duplicate.port=4000;
         assert!(m.static_ip_import(vec![duplicate]).is_err());
         assert_eq!(m.static_ip_list().entries.len(),1);
+    }
+    #[test]
+    fn batch_delete_preserves_unselected_entries_and_persists_once_validated() {
+        let dir=temp_dir(); let path=dir.join("credentials.json");
+        let m=manager(Some(path.clone()),vec![]);
+        m.static_ip_import(vec![input("192.0.2.10"),input("192.0.2.11"),input("192.0.2.12")]).unwrap();
+        m.static_ip_enabled(2,false).unwrap();
+        let before=std::fs::read(dir.join("static_ips.json")).unwrap();
+        assert!(m.static_ips_delete(&[]).is_err());
+        assert!(m.static_ips_delete(&[1,999]).is_err());
+        assert_eq!(std::fs::read(dir.join("static_ips.json")).unwrap(),before);
+        m.static_ips_delete(&[1,2,1]).unwrap();
+        assert_eq!(m.static_ip_list().entries.iter().map(|e|e.id).collect::<Vec<_>>(),vec![3]);
+        let restarted=manager(Some(path),vec![]);
+        assert_eq!(restarted.static_ip_list().entries.iter().map(|e|e.id).collect::<Vec<_>>(),vec![3]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn batch_delete_rejects_all_when_one_selection_becomes_occupied_or_reserved() {
+        let m=manager(None,vec![]);
+        m.static_ip_import(vec![input("192.0.2.10"),input("192.0.2.11")]).unwrap();
+        m.static_ip_auto_assign(true).unwrap();
+        let mut c=account("pending"); let reservation=m.prepare_static_ip(&mut c).unwrap();
+        assert!(m.static_ips_delete(&[2,1]).is_err());
+        assert_eq!(m.static_ip_list().entries.len(),2);
+        drop(reservation);
+        let id=m.insert_test_personal(account("bound")).await.unwrap();
+        assert!(m.static_ips_delete(&[2,1]).is_err());
+        assert_eq!(m.static_ip_list().entries.len(),2);
+        assert_eq!(m.static_ip_list().entries[0].credential_ids,vec![id]);
+        assert_eq!(m.clone_credential(id).unwrap().proxy_url.as_deref(),Some("http://192.0.2.10:3000"));
+    }
+    #[test]
+    fn batch_delete_storage_failure_keeps_every_entry_in_memory() {
+        let dir=temp_dir(); let m=manager(Some(dir.join("credentials.json")),vec![]);
+        m.static_ip_import(vec![input("192.0.2.10"),input("192.0.2.11")]).unwrap();
+        let path=dir.join("static_ips.json");
+        std::fs::remove_file(&path).unwrap(); std::fs::create_dir(&path).unwrap();
+        assert!(m.static_ips_delete(&[1,2]).is_err());
+        assert_eq!(m.static_ip_list().entries.len(),2);
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn reservation_precedes_network_and_drop_releases_on_failure_or_cancellation() {

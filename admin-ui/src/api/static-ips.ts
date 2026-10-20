@@ -13,6 +13,7 @@ export const importStaticIps = async (entries: StaticIpInput[]) => (await api.po
 export const setStaticIpAutoAssign = async (autoAssign: boolean) => (await api.put('/static-ips/config', { autoAssign })).data
 export const setStaticIpEnabled = async (id: number, enabled: boolean) => (await api.put(`/static-ips/${id}/enabled`, { enabled })).data
 export const deleteStaticIp = async (id: number) => (await api.delete(`/static-ips/${id}`)).data
+export const deleteStaticIps = async (ids: number[]) => (await api.post('/static-ips/batch-delete', { ids })).data
 export const bindStaticIp = async (credentialId: number, ipId: number | null) =>
   (await api.put(`/credentials/${credentialId}/static-ip`, { ipId })).data
 

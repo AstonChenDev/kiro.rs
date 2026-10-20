@@ -1,17 +1,19 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
-import { getStaticIps, importStaticIps, setStaticIpAutoAssign, setStaticIpProviders, setStaticIpEnabled, deleteStaticIp, bindStaticIp, type StaticIpInput } from '@/api/static-ips'
+import { Checkbox } from '@/components/ui/checkbox'
+import { getStaticIps, importStaticIps, setStaticIpAutoAssign, setStaticIpProviders, setStaticIpEnabled, deleteStaticIp, deleteStaticIps, bindStaticIp, type StaticIpInput, type StaticIpEntry } from '@/api/static-ips'
 import { getCredentials } from '@/api/credentials'
 import { eligibleForStaticIp } from '@/lib/static-ip-provider'
 import { parseStaticIpLines } from '@/lib/static-ip-import'
 import { extractErrorMessage } from '@/lib/utils'
 
 const labels = { releasing: '等待请求结束后释放', free: '空闲', occupied: '已占用', reserved: '分配中', disabled: '暂停分配', conflict: '多个账号占用', global: '全局占用' }
+const canDelete = (ip: StaticIpEntry) => ['free', 'disabled'].includes(ip.status) && ip.credentialIds.length === 0
 export function StaticIpDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (v: boolean) => void }) {
   const client = useQueryClient()
   const pool = useQuery({ queryKey: ['static-ips'], queryFn: getStaticIps, enabled: open, refetchInterval: open ? 3000 : false })
@@ -24,7 +26,16 @@ export function StaticIpDialog({ open, onOpenChange }: { open: boolean; onOpenCh
   const recoveryRequired = useRef(false)
   const [needsReload, setNeedsReload] = useState(false)
   const [selected, setSelected] = useState<Record<number, string>>({})
+  const [checkedIds, setCheckedIds] = useState<Set<number>>(() => new Set())
   const [filter, setFilter] = useState('all')
+  useEffect(() => {
+    // Polling can remove an entry or allocate it to a waiting account.
+    const eligibleIds = new Set(open ? pool.data?.entries.filter(ip => canDelete(ip) && (filter === 'all' || ip.status === filter)).map(ip => ip.id) : [])
+    setCheckedIds(previous => {
+      const next = new Set([...previous].filter(id => eligibleIds.has(id)))
+      return next.size === previous.size ? previous : next
+    })
+  }, [open, pool.data, filter])
   async function readLatestPool() {
     const result = await pool.refetch({ cancelRefetch: true })
     // React Query can retain old data on a failed refetch. It cannot confirm a write.
@@ -77,7 +88,16 @@ export function StaticIpDialog({ open, onOpenChange }: { open: boolean; onOpenCh
     } catch (e) { toast.error(extractErrorMessage(e)) }
   }
   const rows = pool.data?.entries ?? []
+  const visibleRows = rows.filter(ip => filter === 'all' || ip.status === filter)
+  const selectableRows = visibleRows.filter(canDelete)
+  const checkedRows = selectableRows.filter(ip => checkedIds.has(ip.id))
   const editsDisabled = busy || needsReload || pool.isError || !pool.data
+  function deleteChecked() {
+    if (editsDisabled || !checkedRows.length) return
+    const ids = checkedRows.map(ip => ip.id)
+    if (!window.confirm(`确定删除以下 ${ids.length} 条静态 IP？\n${checkedRows.map(ip => `#${ip.id} ${ip.url}`).join('\n')}\n此操作仅删除代理记录，不会删除账号。`)) return
+    void run(() => deleteStaticIps(ids), `已删除 ${ids.length} 条静态 IP`, () => setCheckedIds(new Set()))
+  }
   return <Dialog open={open} onOpenChange={v => { if (!busy) onOpenChange(v) }}>
     <DialogContent className="sm:max-w-4xl max-h-[90vh] overflow-y-auto">
       <DialogHeader><DialogTitle>静态 IP 管理</DialogTitle></DialogHeader>
@@ -113,19 +133,35 @@ export function StaticIpDialog({ open, onOpenChange }: { open: boolean; onOpenCh
             <Input className="col-span-2" aria-label="静态 IP 备注" placeholder="备注，例如地区、供应商或到期日期" value={label} onChange={e => setLabel(e.target.value)} /></div>}
         <Button size="sm" onClick={add} disabled={busy || (batch ? !text.trim() : !host.trim())}>{busy ? '处理中…' : batch ? '导入静态 IP' : '添加静态 IP'}</Button>
       </fieldset>
-      <div className="flex justify-between items-center"><span className="font-medium text-sm">静态 IP 列表</span><select aria-label="静态 IP 状态筛选" className="border rounded bg-background p-1 text-sm" value={filter} onChange={e => setFilter(e.target.value)}><option value="all">全部</option>{Object.entries(labels).map(([value, title]) => <option key={value} value={value}>{title}</option>)}</select></div>
+      <div className="flex justify-between items-center"><span className="font-medium text-sm">静态 IP 列表</span><select aria-label="静态 IP 状态筛选" className="border rounded bg-background p-1 text-sm" value={filter} disabled={busy} onChange={e => { setFilter(e.target.value); setCheckedIds(new Set()) }}><option value="all">全部</option>{Object.entries(labels).map(([value, title]) => <option key={value} value={value}>{title}</option>)}</select></div>
+      <div className="flex flex-wrap items-center gap-3 rounded-lg border p-3">
+        <label className="flex items-center gap-2 text-sm">
+          <Checkbox aria-label="全选当前筛选中可删除的静态 IP" disabled={editsDisabled || !selectableRows.length}
+            checked={checkedRows.length === 0 ? false : checkedRows.length === selectableRows.length ? true : 'indeterminate'}
+            onCheckedChange={value => setCheckedIds(new Set(value === true ? selectableRows.map(ip => ip.id) : []))} />
+          全选可删除项
+        </label>
+        <span className="text-sm text-muted-foreground">已选 {checkedRows.length} 条</span>
+        <Button size="sm" variant="outline" disabled={busy || !checkedRows.length} onClick={() => setCheckedIds(new Set())}>清空选择</Button>
+        <Button size="sm" variant="destructive" disabled={editsDisabled || !checkedRows.length} onClick={deleteChecked}>删除选中项（{checkedRows.length}）</Button>
+        <p className="w-full text-xs text-muted-foreground">全选仅针对当前筛选中的空闲或暂停分配项。已占用、分配中及等待释放的 IP 不能删除。</p>
+      </div>
       {pool.isError && <p className="text-sm text-destructive">加载失败：{extractErrorMessage(pool.error)}</p>}
       {pool.isLoading && <p className="text-sm text-muted-foreground">加载中…</p>}
       {!pool.isLoading && !pool.isError && !rows.length && <p className="text-sm text-muted-foreground">尚未添加静态 IP。先添加代理，再开启自动分配。</p>}
-      <div className="space-y-2">{rows.filter(ip => filter === 'all' || ip.status === filter).map(ip => <div key={ip.id} className="border rounded-lg p-3 space-y-2">
-        <div className="flex flex-wrap items-center justify-between gap-2"><span className="font-mono text-sm">{ip.url}</span><span className={ip.status === 'free' ? 'text-sm text-emerald-600' : 'text-sm'}>{labels[ip.status]}{!ip.enabled && ip.status !== 'disabled' ? ' · 暂停新分配' : ''}</span></div>
+      <div className="space-y-2">{visibleRows.map(ip => <div key={ip.id} className={`border rounded-lg p-3 space-y-2 ${checkedIds.has(ip.id) && canDelete(ip) ? 'border-primary bg-primary/5' : ''}`}>
+        <div className="flex flex-wrap items-center justify-between gap-2"><label className="flex items-center gap-2 font-mono text-sm">
+          <Checkbox aria-label={`选择静态 IP ${ip.id}`} disabled={editsDisabled || !canDelete(ip)} checked={checkedIds.has(ip.id) && canDelete(ip)}
+            onCheckedChange={value => setCheckedIds(previous => { const next = new Set(previous); if (value === true) next.add(ip.id); else next.delete(ip.id); return next })} />
+          <span>{ip.url}</span>
+        </label><span className={ip.status === 'free' ? 'text-sm text-emerald-600' : 'text-sm'}>{labels[ip.status]}{!ip.enabled && ip.status !== 'disabled' ? ' · 暂停新分配' : ''}</span></div>
         <p className="text-xs text-muted-foreground">{ip.label ? `${ip.label} · ` : ''}{ip.username ? `用户名：${ip.username}` : '无用户名'} · 密码{ip.hasPassword ? '已配置' : '未配置'}</p>
         {ip.credentialIds.map(id => <div key={id} className="flex gap-2 justify-between items-center text-sm"><span>账号 #{id} {credentials.data?.credentials.find(c => c.id === id)?.email ?? ''}</span><Button size="sm" variant="outline" disabled={editsDisabled} onClick={() => { if (window.confirm('解除后，该账号会恢复原来的全局代理或直连。确定解除静态 IP 绑定？')) void run(() => bindStaticIp(id, null), '已解除绑定，IP 可重新分配') }}>解除绑定</Button></div>)}
         {ip.status === 'free' && <div className="flex gap-2"><select aria-label={`静态 IP ${ip.id} 绑定账号`} className="border rounded bg-background p-1 text-sm min-w-0 flex-1" value={selected[ip.id] ?? ''} disabled={editsDisabled} onChange={e => setSelected({ ...selected, [ip.id]: e.target.value })}>
           <option value="">选择现有账号（可选）</option>{credentials.data?.credentials.filter(c => !c.disabled && eligibleForStaticIp(c, pool.data?.allowedProviders ?? [])).map(c => <option key={c.id} value={c.id}>#{c.id} {c.email ?? ''}</option>)}</select>
           <Button size="sm" variant="outline" disabled={editsDisabled || !selected[ip.id]} onClick={() => void run(() => bindStaticIp(Number(selected[ip.id]), ip.id), '静态 IP 已绑定到账号')}>绑定账号</Button></div>}
         <div className="flex gap-2"><Button size="sm" variant="ghost" disabled={editsDisabled || ip.status === 'reserved'} onClick={() => void run(() => setStaticIpEnabled(ip.id, !ip.enabled), ip.enabled ? '已暂停新分配，已有绑定保留' : '已允许分配')}>{ip.enabled ? '暂停分配' : '允许分配'}</Button>
-          <Button size="sm" variant="ghost" className="text-destructive" disabled={editsDisabled || !['free', 'disabled'].includes(ip.status)} onClick={() => { if (window.confirm('确定从静态 IP 库删除这条空闲代理？')) void run(() => deleteStaticIp(ip.id), '静态 IP 已删除') }}>删除</Button></div>
+          <Button size="sm" variant="ghost" className="text-destructive" disabled={editsDisabled || !canDelete(ip)} onClick={() => { if (window.confirm('确定从静态 IP 库删除这条空闲代理？')) void run(() => deleteStaticIp(ip.id), '静态 IP 已删除') }}>删除</Button></div>
       </div>)}</div>
     </DialogContent>
   </Dialog>

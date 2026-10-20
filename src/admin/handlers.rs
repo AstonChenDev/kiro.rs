@@ -1976,6 +1976,9 @@ pub async fn static_ips_list(State(state): State<AdminState>) -> impl IntoRespon
 #[serde(rename_all="camelCase", deny_unknown_fields)]
 pub struct StaticIpBatch { entries: Vec<crate::kiro::token_manager::static_ips::StaticIpInput> }
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticIpDeleteBatch { ids: Vec<u64> }
+#[derive(serde::Deserialize)]
 #[serde(rename_all="camelCase", deny_unknown_fields)]
 pub struct StaticIpConfig { auto_assign: Option<bool>, allowed_providers: Option<Vec<String>> }
 #[derive(serde::Deserialize)]
@@ -1998,6 +2001,9 @@ pub async fn static_ips_config(State(s): State<AdminState>, Json(r): Json<Static
 }
 pub async fn static_ips_delete(State(s): State<AdminState>, Path(id): Path<u64>) -> Response {
     static_ip_result(s.service.token_manager().static_ip_delete(id))
+}
+pub async fn static_ips_batch_delete(State(s): State<AdminState>, Json(r): Json<StaticIpDeleteBatch>) -> Response {
+    static_ip_result(s.service.token_manager().static_ips_delete(&r.ids))
 }
 pub async fn static_ips_enabled(State(s): State<AdminState>, Path(id): Path<u64>, Json(r): Json<StaticIpEnabled>) -> Response {
     static_ip_result(s.service.token_manager().static_ip_enabled(id,r.enabled))

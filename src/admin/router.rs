@@ -72,6 +72,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
     let authenticated = Router::new()
         .route("/static-ips", get(super::handlers::static_ips_list).post(super::handlers::static_ips_import))
         .route("/static-ips/config", put(super::handlers::static_ips_config))
+        .route("/static-ips/batch-delete", post(super::handlers::static_ips_batch_delete))
         .route("/static-ips/{id}", delete(super::handlers::static_ips_delete))
         .route("/static-ips/{id}/enabled", put(super::handlers::static_ips_enabled))
         .route("/credentials/{id}/static-ip", put(super::handlers::static_ips_bind))
