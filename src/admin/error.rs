@@ -13,6 +13,8 @@ use super::types::AdminErrorResponse;
 /// Admin 服务错误类型
 #[derive(Debug)]
 pub enum AdminServiceError {
+    /// Safe diagnostic for transport failures during credential initialization.
+    ImportNetwork { stage: &'static str, kind: &'static str, attempts: usize },
     /// 凭据不存在
     NotFound { id: u64 },
 
@@ -35,6 +37,8 @@ pub enum AdminServiceError {
 impl fmt::Display for AdminServiceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            AdminServiceError::ImportNetwork { stage, kind, attempts } =>
+                write!(f, "{}网络请求失败：{}（已尝试 {} 次），请检查网络或代理后重试", stage, kind, attempts),
             AdminServiceError::NotFound { id } => {
                 write!(f, "凭据不存在: {}", id)
             }
@@ -53,6 +57,7 @@ impl AdminServiceError {
     /// 获取对应的 HTTP 状态码
     pub fn status_code(&self) -> StatusCode {
         match self {
+            AdminServiceError::ImportNetwork { .. } => StatusCode::BAD_GATEWAY,
             AdminServiceError::NotFound { .. } => StatusCode::NOT_FOUND,
             AdminServiceError::UpstreamError(_) => StatusCode::BAD_GATEWAY,
             AdminServiceError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
@@ -65,6 +70,7 @@ impl AdminServiceError {
     /// 转换为 API 错误响应
     pub fn into_response(self) -> AdminErrorResponse {
         match &self {
+            AdminServiceError::ImportNetwork { .. } => AdminErrorResponse::api_error(self.to_string()),
             AdminServiceError::NotFound { .. } => AdminErrorResponse::not_found(self.to_string()),
             AdminServiceError::UpstreamError(_) => AdminErrorResponse::api_error(self.to_string()),
             AdminServiceError::RateLimited { .. } => {
@@ -149,5 +155,18 @@ mod credential_status_regressions {
         assert_eq!(AdminServiceError::InvalidRequest("rpm 越界".into()).status_code(), StatusCode::BAD_REQUEST);
         assert_eq!(AdminServiceError::NotFound { id: 1 }.status_code(), StatusCode::NOT_FOUND);
         assert_eq!(AdminServiceError::UpstreamError("network".into()).status_code(), StatusCode::BAD_GATEWAY);
+    }
+}
+
+#[cfg(test)]
+mod import_network_diagnostics_tests {
+    use super::*;
+    #[test]
+    fn import_network_failures_are_502_with_safe_actionable_details() {
+        let error=AdminServiceError::ImportNetwork {stage:"刷新 Token",kind:"连接中断",attempts:3};
+        assert_eq!(error.status_code(),StatusCode::BAD_GATEWAY);
+        let text=error.to_string();
+        assert!(text.contains("刷新 Token") && text.contains("连接中断") && text.contains("3 次"));
+        assert!(!text.contains("内部错误"));
     }
 }

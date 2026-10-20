@@ -136,6 +136,9 @@ pub struct SetPriorityRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddCredentialRequest {
+    /// 导出文件中的订阅缓存；后续上游额度查询会更新，不改变手动策略覆盖。
+    #[serde(default)]
+    pub subscription_title: Option<String>,
     #[serde(default)]
     pub traffic: crate::kiro::traffic::CredentialTraffic,
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
@@ -305,6 +308,7 @@ pub struct BatchImportRequest {
     pub concurrency: Option<u8>,
     /// 是否验活。`true`（缺省）：add 后取余额校验，失败回滚；
     /// `false`：仅 add 落库（"直接导入"），不取余额、不回滚。
+    /// 自动分配静态 IP 的个人账号始终先刷新 Token 并查询真实额度，再落库分配；缺少 IP 时返回 waiting。
     #[serde(default = "default_batch_verify")]
     pub verify: bool,
 }
@@ -321,7 +325,7 @@ pub struct BatchImportEvent {
     /// 对应请求数组下标；summary 事件为 None
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<usize>,
-    /// "verified" | "duplicate" | "failed" | "summary"
+    /// "verified" | "imported" | "waiting" | "duplicate" | "failed" | "summary"
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_id: Option<u64>,
@@ -350,6 +354,8 @@ pub struct BatchImportSummary {
     /// 直接导入（未验活）成功数
     pub imported: usize,
     pub verified: usize,
+    /// 已完成初始化并入库，但等待静态 IP。
+    pub waiting: usize,
     pub duplicate: usize,
     pub failed: usize,
     pub rolled_back: usize,

@@ -1,20 +1,7 @@
 import { expect, test } from 'bun:test'
-import { readFileSync } from 'node:fs'
-import type { Policies, PolicyPatch } from '../src/api/traffic'
-const source = readFileSync(new URL('../src/components/traffic-controls.tsx', import.meta.url), 'utf8')
-const start = source.indexOf('          if (!valid(draft.defaultConcurrency)')
-const end = source.indexOf('\n        }}>{save.isPending', start)
-const code = new Bun.Transpiler({loader:'tsx'}).transformSync(source.slice(start,end))
-const TIERS = ['free','pro','pro_plus','max','power','student'] as const
+import type { Policies } from '../src/api/traffic'
+import { buildPolicyPatch as submit, trafficPolicySource } from '../src/lib/traffic-policy'
 const policy = (): Policies => ({tiers:{power:{concurrency:10,rpm:20}},defaultConcurrency:0,autoDisableQuota:true,disableAtBaseQuota:true})
-function submit(original: Policies, draft: Policies) {
-  let result: PolicyPatch | undefined
-  const args = { original, draft, TIERS,
-    valid: (v: number|null) => v === null || (Number.isInteger(v) && v >= 0 && v <= 100000),
-    save:{mutate:(patch:PolicyPatch)=>{result=patch}},toast:{error:(m:string)=>{throw Error(m)}} }
-  new Function(...Object.keys(args),code)(...Object.values(args))
-  return result!
-}
 test('two editors send only their separately changed concurrency and RPM fields', () => {
   const original=policy(), a=structuredClone(original), b=structuredClone(original)
   a.tiers.power!.concurrency=30; b.tiers.power!.rpm=40
@@ -35,4 +22,29 @@ test('unchanged inherited fields do not get written alongside other edits', () =
 test('invalid fields are rejected before any mutation is sent', () => {
   const original=policy(),draft=structuredClone(original);draft.tiers.power!.rpm=100001
   expect(()=>submit(original,draft)).toThrow('请输入')
+})
+
+test('type defaults and subscription edits only send changed leaves', () => {
+  const original=policy()
+  original.accountTypes={google:{defaults:{concurrency:3,rpm:20},tiers:{max:{concurrency:5,rpm:40}}}}
+  const a=structuredClone(original), b=structuredClone(original)
+  a.accountTypes!.google!.tiers.max!.concurrency=0
+  b.accountTypes!.google!.defaults.rpm=null
+  expect(submit(original,a)).toEqual({tiers:{},accountTypes:{google:{tiers:{max:{concurrency:0}}}}})
+  expect(submit(original,b)).toEqual({tiers:{},accountTypes:{google:{defaults:{rpm:null}}}})
+})
+test('new type and unknown subscription are configurable without resetting other policies', () => {
+  const original=policy(), draft=structuredClone(original)
+  draft.accountTypes={enterprise:{defaults:{concurrency:null,rpm:null},tiers:{unknown:{concurrency:2,rpm:null}}}}
+  expect(submit(original,draft)).toEqual({tiers:{},accountTypes:{enterprise:{tiers:{unknown:{concurrency:2}}}}})
+  draft.accountTypes.enterprise!.tiers.unknown!.rpm=-1
+  expect(()=>submit(original,draft)).toThrow('请输入')
+})
+test('unchanged empty type policies emit no edits and sources distinguish every layer', () => {
+  const original=policy(), draft=structuredClone(original)
+  draft.accountTypes={github:{defaults:{concurrency:null,rpm:null},tiers:{}}}
+  expect(submit(original,draft)).toEqual({tiers:{}})
+  expect(trafficPolicySource('account_type_tier')).toBe('登录类型＋订阅等级')
+  expect(trafficPolicySource('account_type')).toBe('登录类型默认')
+  expect(trafficPolicySource('tier')).toBe('通用订阅等级')
 })

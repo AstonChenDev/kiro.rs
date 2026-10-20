@@ -177,6 +177,8 @@ export interface SetPriorityRequest {
 
 // 添加凭据请求
 export interface AddCredentialRequest {
+  /** 导入文件的订阅缓存；后续联网查询会更新。 */
+  subscriptionTitle?: string
   traffic?: Partial<CredentialTraffic>
   refreshToken?: string
   accessToken?: string

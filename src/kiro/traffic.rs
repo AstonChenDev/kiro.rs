@@ -2,6 +2,32 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::{Arc, atomic::{AtomicU32, Ordering}}};
 use futures::{Stream, StreamExt};
+use super::model::credentials::{KiroCredentials, canonicalize_auth_method_value};
+
+/// Login identity is independent of the subscription title and static-IP eligibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountType { Enterprise, Github, Google, BuilderId, IamSso, EntraId, ApiKey, Unknown }
+
+impl AccountType {
+    pub fn detect(c: &KiroCredentials) -> Self {
+        if c.is_api_key_credential() { return Self::ApiKey; }
+        let provider = c.provider.as_deref().unwrap_or_default().trim().to_ascii_lowercase();
+        if c.is_external_idp_credential() {
+            return if matches!(provider.as_str(), "azuread" | "entra_id" | "entraid") { Self::EntraId } else { Self::Enterprise };
+        }
+        let method = canonicalize_auth_method_value(c.auth_method.as_deref().unwrap_or_else(||
+            if c.client_id.is_some() && c.client_secret.is_some() { "idc" } else { "" }).trim()).to_ascii_lowercase();
+        match (method.as_str(), provider.as_str()) {
+            ("social" | "", "github") => Self::Github,
+            ("social" | "", "google") => Self::Google,
+            ("idc" | "", "builderid" | "builder-id" | "builder_id") => Self::BuilderId,
+            ("idc" | "", "enterprise") => Self::Enterprise,
+            ("idc" | "", "iam_sso" | "iam-sso") => Self::IamSso,
+            _ => Self::Unknown,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,9 +73,22 @@ impl CredentialTraffic {
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct TrafficPolicies {
     pub tiers: BTreeMap<AccountTier, Limits>,
+    pub account_types: BTreeMap<AccountType, AccountTypePolicy>,
     pub default_concurrency: u32,
     pub auto_disable_quota: bool,
     pub disable_at_base_quota: bool,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountTypePolicy {
+    pub defaults: Limits,
+    pub tiers: BTreeMap<AccountTier, Limits>,
+}
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountTypePolicyPatch {
+    pub defaults: LimitPatch,
+    pub tiers: BTreeMap<AccountTier, LimitPatch>,
 }
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
@@ -69,6 +108,7 @@ fn present_limit<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Op
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct TrafficPolicyPatch {
     pub tiers: BTreeMap<AccountTier, LimitPatch>,
+    pub account_types: BTreeMap<AccountType, AccountTypePolicyPatch>,
     pub default_concurrency: Option<u32>,
     pub auto_disable_quota: Option<bool>,
     pub disable_at_base_quota: Option<bool>,
@@ -79,27 +119,37 @@ impl Default for TrafficPolicies {
         Self { tiers: [AccountTier::Free, AccountTier::Pro, AccountTier::ProPlus,
             AccountTier::Max, AccountTier::Power, AccountTier::Student].into_iter()
             .map(|tier| (tier, Limits::default())).collect(),
-            default_concurrency: 0, auto_disable_quota: true, disable_at_base_quota: true }
+            account_types: BTreeMap::new(), default_concurrency: 0, auto_disable_quota: true, disable_at_base_quota: true }
     }
 }
 impl TrafficPolicies {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.default_concurrency <= 100_000, "默认并发不能超过 100000");
         for limits in self.tiers.values() { limits.validate()?; }
+        for policy in self.account_types.values() {
+            policy.defaults.validate()?;
+            for limits in policy.tiers.values() { limits.validate()?; }
+        }
         Ok(())
     }
+    #[cfg(test)]
     pub fn resolve(&self, credential: &CredentialTraffic, title: Option<&str>, default_rpm: u32) -> EffectiveLimits {
+        self.resolve_for_type(credential, title, default_rpm, AccountType::Unknown)
+    }
+    pub fn resolve_for_type(&self, credential: &CredentialTraffic, title: Option<&str>, default_rpm: u32, account_type: AccountType) -> EffectiveLimits {
         let tier = credential.tier.unwrap_or_else(|| AccountTier::detect(title));
         let defaults = self.tiers.get(&tier).cloned().unwrap_or_default();
-        let source = |own: Option<u32>, category: Option<u32>| {
-            if own.is_some() { "credential" } else if category.is_some() { "tier" } else { "global" }.to_string()
+        let typed = self.account_types.get(&account_type).cloned().unwrap_or_default();
+        let typed_tier = typed.tiers.get(&tier).cloned().unwrap_or_default();
+        let resolve = |own, specific, type_default, category, global| {
+            [(own, "credential"), (specific, "account_type_tier"), (type_default, "account_type"), (category, "tier")]
+                .into_iter().find_map(|(value, source): (Option<u32>, &str)| value.map(|v| (v, source.to_string())))
+                .unwrap_or((global, "global".to_string()))
         };
+        let (concurrency, concurrency_source) = resolve(credential.concurrency, typed_tier.concurrency, typed.defaults.concurrency, defaults.concurrency, self.default_concurrency);
+        let (rpm, rpm_source) = resolve(credential.rpm, typed_tier.rpm, typed.defaults.rpm, defaults.rpm, default_rpm);
         EffectiveLimits {
-            tier,
-            concurrency: credential.concurrency.or(defaults.concurrency).unwrap_or(self.default_concurrency),
-            rpm: credential.rpm.or(defaults.rpm).unwrap_or(default_rpm),
-            concurrency_source: source(credential.concurrency, defaults.concurrency),
-            rpm_source: source(credential.rpm, defaults.rpm),
+            tier, account_type, concurrency, rpm, concurrency_source, rpm_source,
         }
     }
 }
@@ -107,6 +157,7 @@ impl TrafficPolicies {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EffectiveLimits {
+    pub account_type: AccountType,
     pub tier: AccountTier, pub concurrency: u32, pub rpm: u32,
     pub concurrency_source: String, pub rpm_source: String,
 }
@@ -154,6 +205,49 @@ impl LimitedResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn login_type_comes_from_authentication_not_subscription() {
+        for (method, provider, expected) in [
+            ("social", "Google", AccountType::Google), ("social", "GitHub", AccountType::Github),
+            ("idc", "Enterprise", AccountType::Enterprise), ("builder-id", "BuilderId", AccountType::BuilderId),
+            ("iam", "iam_sso", AccountType::IamSso), ("external_idp", "AzureAD", AccountType::EntraId),
+            ("external_idp", "Google", AccountType::Enterprise), ("api_key", "Google", AccountType::ApiKey),
+            ("idc", "Google", AccountType::Unknown), ("social", "other", AccountType::Unknown),
+        ] {
+            for title in ["KIRO POWER", "KIRO PRO MAX", "KIRO FREE"] {
+                let c = KiroCredentials { auth_method: Some(method.into()), provider: Some(provider.into()), subscription_title: Some(title.into()), ..Default::default() };
+                assert_eq!(AccountType::detect(&c), expected, "{method}/{provider}/{title}");
+            }
+        }
+        for (provider, expected) in [("Google", AccountType::Google), ("builder_id", AccountType::BuilderId), ("Enterprise", AccountType::Enterprise)] {
+            assert_eq!(AccountType::detect(&KiroCredentials { provider: Some(provider.into()), ..Default::default() }), expected);
+        }
+    }
+
+    #[test]
+    fn typed_limits_resolve_each_field_and_preserve_legacy_fallback() {
+        let mut p: TrafficPolicies = serde_json::from_value(serde_json::json!({"tiers":{"max":{"concurrency":8,"rpm":80}},"defaultConcurrency":9})).unwrap();
+        assert!(p.account_types.is_empty());
+        let own = CredentialTraffic::default();
+        let resolve = |p: &TrafficPolicies, c: &CredentialTraffic, t| p.resolve_for_type(c, Some("KIRO PRO MAX"), 90, t);
+        assert_eq!(resolve(&p, &own, AccountType::Google).rpm, 80);
+        p.account_types.insert(AccountType::Google, AccountTypePolicy { defaults: Limits { concurrency: Some(4), rpm: Some(40) },
+            tiers: [(AccountTier::Max, Limits { concurrency: Some(2), rpm: None })].into() });
+        let r = resolve(&p, &own, AccountType::Google);
+        assert_eq!((r.concurrency,r.rpm), (2,40));
+        assert_eq!((r.concurrency_source.as_str(),r.rpm_source.as_str()), ("account_type_tier","account_type"));
+        assert_eq!(resolve(&p, &own, AccountType::Github).rpm,80);
+        let c = CredentialTraffic { concurrency: Some(0), ..Default::default() };
+        assert_eq!(resolve(&p,&c,AccountType::Google).concurrency,0);
+        p.account_types.get_mut(&AccountType::Google).unwrap().defaults.rpm=None;
+        assert_eq!(resolve(&p,&own,AccountType::Google).rpm,80);
+        p.tiers.clear();
+        assert_eq!(resolve(&p,&own,AccountType::Google).rpm,90);
+        let saved = serde_json::to_value(&p).unwrap();
+        let restored: TrafficPolicies = serde_json::from_value(saved).unwrap();
+        assert_eq!(resolve(&restored,&own,AccountType::Google).concurrency,2);
+    }
+
     #[test]
     fn limit_patch_preserves_omission_null_and_zero() {
         let empty: LimitPatch = serde_json::from_str("{}").unwrap();

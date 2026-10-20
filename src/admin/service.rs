@@ -15,6 +15,7 @@ use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
+use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::model::credentials::{
     CredentialMetadata, KiroCredentials, credential_metadata_schema,
     normalize_credential_metadata_schema, normalize_import_auth_method,
@@ -213,6 +214,8 @@ pub(crate) enum ImportStatus {
     Verified,
     /// 直接导入（未验活）成功
     Imported,
+    /// 已完成初始化并保存，等待静态 IP；不再重复查询或删除回滚。
+    Waiting,
     Duplicate,
     Failed,
 }
@@ -232,6 +235,7 @@ impl ImportItemResult {
         let status = match self.status {
             ImportStatus::Verified => "verified",
             ImportStatus::Imported => "imported",
+            ImportStatus::Waiting => "waiting",
             ImportStatus::Duplicate => "duplicate",
             ImportStatus::Failed => "failed",
         }
@@ -1122,6 +1126,10 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_balance_error(e, id))?;
 
+        Ok(Self::balance_from_usage(id, usage))
+    }
+
+    fn balance_from_usage(id: u64, usage: UsageLimitsResponse) -> BalanceResponse {
         let current_usage = usage.current_usage();
         let usage_limit = usage.usage_limit();
         // 允许 remaining 显示为负值：开启超额后实际使用可能超过限额，
@@ -1134,7 +1142,7 @@ impl AdminService {
             0.0
         };
 
-        Ok(BalanceResponse {
+        BalanceResponse {
             id,
             subscription_title: usage.subscription_title().map(|s| s.to_string()),
             current_usage,
@@ -1148,7 +1156,7 @@ impl AdminService {
                 .subscription_info
                 .as_ref()
                 .and_then(|s| s.overage_capability.clone()),
-        })
+        }
     }
 
     /// 获取指定凭据当前可用的模型列表（实时查询上游，成功后更新共享模型缓存）
@@ -1508,20 +1516,20 @@ impl AdminService {
         req: AddCredentialRequest,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
         // 默认获取余额（保持单条添加 / 登录路径的既有行为：加完即可见订阅等级）
-        self.add_credential_inner(req, true).await
+        self.add_credential_inner(req, true).await.map(|(response, _)| response)
     }
 
     /// 添加凭据的核心实现。
     ///
     /// - `fetch_balance = true`：添加后主动拉取余额（含订阅等级 / 邮箱）并写入缓存，
     ///   既是"加完即可见"，也作为 API Key 的有效性校验（即"验活"）。
-    /// - `fetch_balance = false`：跳过余额拉取，仅落库（"直接导入"路径），
+    /// - 非静态 IP 账号 `fetch_balance = false`：跳过余额拉取，仅落库（"直接导入"路径），
     ///   订阅信息留待首次请求时按需获取。
     async fn add_credential_inner(
         &self,
         req: AddCredentialRequest,
         fetch_balance: bool,
-    ) -> Result<AddCredentialResponse, AdminServiceError> {
+    ) -> Result<(AddCredentialResponse, bool), AdminServiceError> {
         validate_credential_metadata(&req.metadata, &self.credential_metadata_schema.lock())
             .map_err(|error| AdminServiceError::InvalidRequest(error.to_string()))?;
         // 校验端点名：未指定则默认合法，指定则必须已注册
@@ -1605,7 +1613,7 @@ impl AdminService {
             api_region: req.api_region,
             machine_id: req.machine_id,
             email: req.email,
-            subscription_title: None, // 将在首次获取使用额度时自动更新
+            subscription_title: req.subscription_title.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
             proxy_url: req.proxy_url,
             static_ip_required: false,
             proxy_username: req.proxy_username,
@@ -1625,35 +1633,77 @@ impl AdminService {
             created_at: None,
         };
 
-        // 调用 token_manager 添加凭据
-        let credential_id = self
-            .token_manager
-            .add_credential_with_proxy_origin(new_cred, req.proxy_auto_assigned)
-            .await
+        let (credential_id, initialized) = self.add_initialized_credential(new_cred, req.proxy_auto_assigned, fetch_balance).await?;
+        Ok((AddCredentialResponse {
+            success: true,
+            message: format!("凭据添加成功，ID: {}", credential_id),
+            credential_id,
+            email,
+        }, initialized))
+    }
+
+    /// All new-account entry points must retain the initial quota before IP allocation.
+    async fn add_initialized_credential(&self, credential: KiroCredentials, proxy_auto_assigned: bool, fetch_balance: bool)
+        -> Result<(u64, bool), AdminServiceError> {
+        let imported = self.token_manager.import_credential_with_metadata(credential, proxy_auto_assigned).await
             .map_err(|e| self.classify_add_error(e))?;
+        self.finish_credential_import(imported, fetch_balance).await
+    }
+
+    async fn finish_credential_import(&self, imported: crate::kiro::token_manager::CredentialImport, fetch_balance: bool)
+        -> Result<(u64, bool), AdminServiceError> {
+        let credential_id = imported.id;
+        let initialized = imported.usage.is_some();
+        if let Some(usage) = imported.usage {
+            let balance = Self::balance_from_usage(credential_id, usage);
+            let identity = self.token_manager.balance_identity(credential_id)
+                .map_err(|e| self.classify_error(e, credential_id))?;
+            // Apply quota policy and persist the REAL initial balance before permitting
+            // allocation. In particular, depleted accounts must never be auto-enabled.
+            self.apply_balance_quota_policy(&balance, &identity)?;
+            let now = Utc::now();
+            self.balance_cache.lock().insert(credential_id, CachedBalance {
+                auth_fingerprint: Some(self.token_manager.balance_cache_fingerprint(credential_id, &identity)
+                    .map_err(|e| self.classify_error(e, credential_id))?),
+                traffic_identity: Some(identity),
+                cached_at: now.timestamp() as f64 + now.timestamp_subsec_nanos() as f64 / 1e9,
+                data: balance,
+            });
+            if let Err(error) = self.save_balance_cache_checked() {
+                tracing::warn!(credential_id, %error, "初始额度缓存保存失败，保留账号并禁用");
+                // Still hold the import lease: maintenance cannot allocate an IP
+                // between the failed save and the durable disabled-state transition.
+                let already_disabled = self.token_manager.clone_credential(credential_id)
+                    .is_some_and(|c| c.disabled && c.disabled_reason.as_deref() != Some("WaitingStaticIp"));
+                if !already_disabled && self.token_manager.set_disabled(credential_id, true).is_err() {
+                    return Err(AdminServiceError::InternalError(format!(
+                        "凭据 #{credential_id} 初始额度缓存保存失败，账号已在内存中禁用，但禁用状态也未能保存；请检查本地存储")));
+                }
+                return Err(AdminServiceError::InternalError(format!(
+                    "凭据 #{credential_id} 已保留并禁用：初始额度缓存保存失败，请修复本地存储后刷新额度，再手动启用")));
+            }
+        }
+        drop(imported.allocation_guard);
+        self.token_manager.reconcile_static_ips_logged();
 
         // 主动获取余额（含订阅等级 / 邮箱）并写入缓存，添加后立即可见，
         // 同时避免首次请求时 Free 账号绕过 Opus 模型过滤。
         // 仅验活路径需要；"直接导入"路径跳过以省掉这次上游往返。
-        if fetch_balance {
+        if fetch_balance && !initialized {
             if let Err(e) = self.get_balance(credential_id).await {
                 tracing::warn!("添加凭据后刷新余额失败（不影响凭据添加）: {}", e);
             }
         }
 
-        Ok(AddCredentialResponse {
-            success: true,
-            message: format!("凭据添加成功，ID: {}", credential_id),
-            credential_id,
-            email,
-        })
+        Ok((credential_id, initialized))
     }
 
     /// 批量导入的单条处理。
     ///
-    /// - `verify = true`（验活路径）：add（内部 refresh + 缓存 balance）→ 显式取余额验活
+    /// - 自动分配静态 IP 的个人账号：正常刷新与查询额度后入库，再分配；waiting 也携带完整额度。
+    /// - 其他账号 `verify = true`（验活路径）：add（内部 refresh + 缓存 balance）→ 显式取余额验活
     ///   → 失败回滚删除。镜像前端旧流程的"add → getCredentialBalance → 失败回滚"。
-    /// - `verify = false`（直接导入路径）：仅 add 落库，不取余额、不回滚。
+    /// - 其他账号 `verify = false`（直接导入路径）：仅 add 落库，不取余额、不回滚。
     ///
     /// 全部在服务端完成，便于在 `buffer_unordered` 下有界并发。
     pub async fn import_one_credential(
@@ -1662,8 +1712,8 @@ impl AdminService {
         verify: bool,
     ) -> ImportItemResult {
         // 1. add：去重 / 未知端点 / token 刷新失败在此暴露，未插入即无需回滚。
-        //    verify=false 时跳过内部余额拉取。
-        let resp = match self.add_credential_inner(req, verify).await {
+        //    普通账号 verify=false 时跳过内部余额拉取；静态管理账号始终正常初始化。
+        let (resp, initialized) = match self.add_credential_inner(req, verify).await {
             Ok(r) => r,
             Err(e) => {
                 let msg = e.to_string();
@@ -1683,12 +1733,30 @@ impl AdminService {
             }
         };
 
-        // 2. 直接导入：add 成功即完成，不做余额验活、不回滚。
+        self.finish_batch_import(resp, initialized, verify).await
+    }
+
+    async fn finish_batch_import(&self, resp: AddCredentialResponse, initialized: bool, verify: bool) -> ImportItemResult {
+        // Static control runs only after normal initialization, including for the
+        // direct-import button. Waiting is a scheduling state, not missing metadata.
+        if initialized {
+            let balance = self.balance_cache.lock().get(&resp.credential_id).map(|c| c.data.clone());
+            return ImportItemResult {
+                status: if self.token_manager.is_waiting_static_ip(resp.credential_id) {
+                    ImportStatus::Waiting
+                } else { ImportStatus::Verified },
+                credential_id: Some(resp.credential_id),
+                email: resp.email,
+                balance,
+                error: None,
+                rolled_back: false,
+            };
+        }
         if !verify {
             return ImportItemResult {
                 status: ImportStatus::Imported,
                 credential_id: Some(resp.credential_id),
-                email: resp.email.clone(),
+                email: resp.email,
                 balance: None,
                 error: None,
                 rolled_back: false,
@@ -2954,15 +3022,18 @@ impl AdminService {
     }
 
     fn save_balance_cache(&self) {
-        let Some(path) = &self.cache_path else { return; };
+        if let Err(error) = self.save_balance_cache_checked() {
+            tracing::warn!("保存余额缓存失败: {}", error);
+        }
+    }
+
+    fn save_balance_cache_checked(&self) -> anyhow::Result<()> {
+        let Some(path) = &self.cache_path else { return Ok(()); };
         let cache = self.balance_cache.lock();
         let _disk_guard = self.token_manager.balance_cache_write_lock.lock();
-        let result = (|| -> anyhow::Result<()> {
-            let mut value = serde_json::to_value(&*cache)?;
-            self.token_manager.update_balance_cache_fingerprints(&mut value);
-            MultiTokenManager::write_balance_cache_file(path, &value)
-        })();
-        if let Err(error) = result { tracing::warn!("保存余额缓存失败: {}", error); }
+        let mut value = serde_json::to_value(&*cache)?;
+        self.token_manager.update_balance_cache_fingerprints(&mut value);
+        MultiTokenManager::write_balance_cache_file(path, &value)
     }
 
     // ============ 代理池管理 ============
@@ -3278,6 +3349,9 @@ impl AdminService {
 
     /// 分类添加凭据错误
     fn classify_add_error(&self, e: anyhow::Error) -> AdminServiceError {
+        if let Some(error) = e.downcast_ref::<crate::kiro::token_manager::ImportNetworkError>() {
+            return AdminServiceError::ImportNetwork { stage: error.stage, kind: error.kind, attempts: error.attempts };
+        }
         if e.downcast_ref::<crate::kiro::token_manager::static_ips::StaticIpError>().is_some() { return AdminServiceError::InvalidRequest(e.to_string()); }
         if let Some(reason) = crate::kiro::error::credential_error_reason(&e) { return AdminServiceError::InvalidCredential(reason); }
         if let Some(error) = classify_rate_limit(&e) {
@@ -3549,16 +3623,7 @@ impl AdminService {
             new_cred.profile_arn = Some(arn);
         }
 
-        let credential_id = self
-            .token_manager
-            .add_credential(new_cred)
-            .await
-            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-
-        // 主动刷新余额（含订阅等级 / 邮箱）并写入缓存，登录后立即可见
-        if let Err(e) = self.get_balance(credential_id).await {
-            tracing::warn!("Social 登录后刷新余额失败（不影响登录）: {}", e);
-        }
+        let (credential_id, _) = self.add_initialized_credential(new_cred, false, true).await?;
 
         tracing::info!("Social 登录成功，已添加凭据 #{}", credential_id);
         Ok(PollIdcLoginResponse::Success { credential_id })
@@ -3810,16 +3875,7 @@ impl AdminService {
                     new_cred.expires_at = Some((Utc::now() + Duration::seconds(secs)).to_rfc3339());
                 }
 
-                let credential_id = self
-                    .token_manager
-                    .add_credential(new_cred)
-                    .await
-                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-
-                // 主动刷新余额（含订阅等级 / 邮箱）并写入缓存，登录后立即可见
-                if let Err(e) = self.get_balance(credential_id).await {
-                    tracing::warn!("IdC 登录后刷新余额失败（不影响登录）: {}", e);
-                }
+                let (credential_id, _) = self.add_initialized_credential(new_cred, false, true).await?;
 
                 tracing::info!("IdC 设备授权登录成功，已添加凭据 #{}", credential_id);
                 Ok(PollIdcLoginResponse::Success { credential_id })
@@ -4691,5 +4747,202 @@ mod manual_quota_review_tests {
     #[tokio::test]
     async fn failed_manual_review_keeps_last_balance_without_reporting_cached_success_or_disabling() {
         review(100, 10, false, true).await;
+    }
+}
+
+#[cfg(test)]
+mod static_waiting_import_tests {
+    use super::*;
+    use crate::kiro::token_manager::static_ips::StaticIpInput;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn ip(n: u8) -> StaticIpInput {
+        StaticIpInput { host:format!("192.0.2.{n}"),port:3000,protocol:"http".into(),username:None,password:None,label:None }
+    }
+    fn request(n: usize) -> AddCredentialRequest {
+        serde_json::from_value(serde_json::json!({
+            "refreshToken":format!("account-{n}").repeat(120),"authMethod":"social","provider":"Github",
+            "subscriptionTitle":"KIRO FREE","accessToken":"old-access","expiresAt":"2020-01-01T00:00:00Z"
+        })).unwrap()
+    }
+    fn initializer(manager: &Arc<MultiTokenManager>, usage: f64) -> Arc<AtomicUsize> {
+        let calls=Arc::new(AtomicUsize::new(0)); let count=calls.clone();
+        let weak=Arc::downgrade(manager);
+        *manager.test_import_initializer.lock()=Some(Arc::new(move |mut c, proxy| {
+            let count=count.clone(); let weak=weak.clone();
+            Box::pin(async move {
+                // Initialization must see the original route, never a static binding.
+                assert!(!c.static_ip_required && c.proxy_url.is_none() && proxy.is_none());
+                assert!(weak.upgrade().unwrap().static_ip_list().entries.iter().all(|ip| !ip.credential_ids.contains(&c.id.unwrap_or(0))));
+                count.fetch_add(1,Ordering::SeqCst);
+                c.access_token=Some("refreshed-access".into());
+                c.expires_at=Some("2099-01-01T00:00:00Z".into());
+                Ok((c, serde_json::from_value(serde_json::json!({
+                    "subscriptionInfo":{"subscriptionTitle":"KIRO PRO+"},
+                    "usageBreakdownList":[{"usageLimitWithPrecision":2000,"currentUsageWithPrecision":usage}],
+                    "overageConfiguration":{"overageEnabled":false}
+                })).unwrap()))
+            })
+        })); calls
+    }
+    // Exercise the post-refresh stage with an explicit static proxy. This branch
+    // has no preloaded usage metadata and must not be confused with queued imports.
+    #[tokio::test]
+    async fn explicit_static_import_checks_usage_before_claiming_verified() {
+        for (verify, success) in [(false,true),(true,true),(true,false)] {
+            let c=KiroCredentials { id:Some(1),auth_method:Some("social".into()),provider:Some("Google".into()),proxy_url:Some("http://192.0.2.1:3000".into()),..Default::default() };
+            let m=Arc::new(MultiTokenManager::new(Config::default(),vec![c],None,None,true).unwrap());
+            m.static_ip_import(vec![ip(1)]).unwrap();
+            assert!(m.clone_credential(1).unwrap().static_ip_required);
+            let service=AdminService::new(m.clone(),vec![]);
+            let calls=Arc::new(AtomicUsize::new(0));let count=calls.clone();
+            *service.test_balance_fetcher.lock()=Some(Arc::new(move |id| {
+                count.fetch_add(1,Ordering::SeqCst);
+                Box::pin(async move {
+                    if !success {return Err(AdminServiceError::InternalError("fixture quota failure".into()));}
+                    Ok(BalanceResponse {id,subscription_title:Some("KIRO PRO+".into()),current_usage:3.0,usage_limit:2000.0,remaining:1997.0,usage_percentage:0.15,next_reset_at:None,overage_enabled:Some(false),overage_capable:Some(false),overage_capability_raw:None})
+                })
+            }));
+            let (id,initialized)=service.finish_credential_import(crate::kiro::token_manager::CredentialImport {id:1,usage:None,allocation_guard:None},verify).await.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst),usize::from(verify),"single import must query usage when requested");
+            let response=AddCredentialResponse {success:true,message:String::new(),credential_id:id,email:None};
+            let result=service.finish_batch_import(response,initialized,verify).await;
+            if !verify {
+                assert!(matches!(result.status,ImportStatus::Imported),"direct import must not claim usage verification");
+                assert_eq!(calls.load(Ordering::SeqCst),0);
+            } else if success {
+                assert!(matches!(result.status,ImportStatus::Verified));
+                assert_eq!(result.balance.unwrap().remaining,1997.0);
+                assert_eq!(calls.load(Ordering::SeqCst),1);
+            } else {
+                assert!(matches!(result.status,ImportStatus::Failed));assert!(result.rolled_back);
+                assert!(m.clone_credential(id).is_none());assert!(m.static_ip_list().entries[0].credential_ids.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=2)]
+    async fn new_login_finalization_retains_usage_without_ip_and_blocks_depleted_accounts() {
+        for provider in ["Google","BuilderId"] {for used in [3.0,2000.0] {
+            let dir=std::env::temp_dir().join(format!("kiro-login-quota-{}",Uuid::new_v4()));std::fs::create_dir_all(&dir).unwrap();
+            let path=dir.join("credentials.json");
+            let m=Arc::new(MultiTokenManager::new(Config::default(),vec![],None,Some(path.clone()),true).unwrap());
+            initializer(&m,used);m.static_ip_config(Some(true),Some(vec!["google".into(),"builderid".into()])).unwrap();
+            let service=AdminService::new(m.clone(),vec![]);
+            *service.test_balance_fetcher.lock()=Some(Arc::new(|_|panic!("login must retain initialized balance without another network request")));
+            let c=KiroCredentials {refresh_token:Some("new-login-fixture".repeat(120)),auth_method:Some(if provider=="Google" {"social"}else{"idc"}.into()),provider:Some(provider.into()),..Default::default()};
+            let (id,initialized)=service.add_initialized_credential(c,false,true).await.unwrap();assert!(initialized);
+            assert_eq!(service.get_balance(id).await.unwrap().remaining,2000.0-used);
+            m.static_ip_import(vec![ip(1)]).unwrap();
+            if used==2000.0 {
+                assert_eq!(m.clone_credential(id).unwrap().disabled_reason.as_deref(),Some("QuotaExceeded"));
+                assert!(m.static_ip_list().entries[0].credential_ids.is_empty());
+            } else { assert_eq!(m.available_count(),1); }
+            let saved=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let reopened=Arc::new(MultiTokenManager::new(Config::default(),saved,None,Some(path),true).unwrap());
+            let service=AdminService::new(reopened,vec![]);
+            assert_eq!(service.get_balance(id).await.unwrap().remaining,2000.0-used);
+            std::fs::remove_dir_all(dir).unwrap();
+        }}
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=2)]
+    async fn initial_quota_cache_write_failure_keeps_account_disabled_and_reports_failure() {
+        let dir=std::env::temp_dir().join(format!("kiro-import-cache-failure-{}",Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();let path=dir.join("credentials.json");
+        let cache_path=dir.join("kiro_balance_cache.json");
+        std::fs::create_dir(&cache_path).unwrap(); // Deterministic atomic-rename failure.
+        let m=Arc::new(MultiTokenManager::new(Config::default(),vec![],None,Some(path.clone()),true).unwrap());
+        initializer(&m,3.0);m.static_ip_config(Some(true),None).unwrap();m.static_ip_import(vec![ip(1)]).unwrap();
+        let service=AdminService::new(m.clone(),vec![]);
+        let result=service.import_one_credential(request(0),true).await;
+        assert!(matches!(result.status,ImportStatus::Failed),"cache persistence failure must not report a verified import");
+        assert_eq!(m.available_count(),0,"failed initialization must not enable an account");
+        let id=m.snapshot().entries[0].id;
+        assert!(result.error.as_deref().unwrap().contains(&format!("#{id}")));
+        assert_eq!(m.clone_credential(id).unwrap().disabled_reason.as_deref(),Some("Manual"));
+        assert!(m.static_ip_list().entries[0].credential_ids.is_empty());
+        let saved=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let restarted=Arc::new(MultiTokenManager::new(Config::default(),saved,None,Some(path),true).unwrap());
+        assert_eq!(restarted.available_count(),0);
+        assert!(restarted.static_ip_list().entries[0].credential_ids.is_empty());
+        // Repair storage, persist the actual balance, then require an explicit enable.
+        std::fs::remove_dir(&cache_path).unwrap();
+        assert_eq!(service.get_balance(id).await.unwrap().remaining,1997.0);
+        service.save_balance_cache();
+        assert!(cache_path.is_file());
+        assert_eq!(m.available_count(),0);
+        service.set_disabled(id,false).unwrap();assert_eq!(m.available_count(),1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=2)]
+    async fn five_imports_have_real_balances_before_static_control_with_zero_three_or_five_ips() {
+        for verify in [true,false] { for ip_count in [0,3,5] {
+            let dir=std::env::temp_dir().join(format!("kiro-import-order-{}",Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();let path=dir.join("credentials.json");
+            let m=Arc::new(MultiTokenManager::new(Config::default(),vec![],None,Some(path.clone()),true).unwrap());
+            let calls=initializer(&m,3.0);
+            m.static_ip_config(Some(true),None).unwrap();
+            if ip_count>0 { m.static_ip_import((1..=ip_count).map(ip).collect()).unwrap(); }
+            let service=AdminService::new(m.clone(),vec![]);
+            *service.test_balance_fetcher.lock()=Some(Arc::new(|_| panic!("must use initial balance even without IP")));
+            let mut ids=vec![];
+            for n in 0..5 {
+                let result=service.import_one_credential(request(n),verify).await;
+                assert!(!result.rolled_back && result.error.is_none());
+                assert!(matches!(result.status,ImportStatus::Verified|ImportStatus::Waiting));
+                let id=result.credential_id.unwrap(); ids.push(id);
+                let balance=result.balance.unwrap();
+                assert_eq!(balance.subscription_title.as_deref(),Some("KIRO PRO+"));
+                assert_eq!(balance.remaining,1997.0);
+                let saved=m.clone_credential(id).unwrap();
+                assert_eq!(saved.access_token.as_deref(),Some("refreshed-access"));
+                assert_eq!(saved.subscription_title.as_deref(),Some("KIRO PRO+"));
+                assert!(saved.traffic.tier.is_none());
+                assert_eq!(service.get_balance(id).await.unwrap().usage_limit,2000.0);
+            }
+            assert_eq!(calls.load(Ordering::SeqCst),5);
+            assert_eq!(m.available_count(),ip_count as usize);
+            assert_eq!(m.static_ip_list().waiting_credential_ids.len(),5-ip_count as usize);
+            let duplicate=service.import_one_credential(request(0),verify).await;
+            assert!(matches!(duplicate.status,ImportStatus::Duplicate));
+            assert_eq!(calls.load(Ordering::SeqCst),5);
+            let saved:Vec<KiroCredentials>=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let reopened=Arc::new(MultiTokenManager::new(Config::default(),saved,None,Some(path),true).unwrap());
+            let reopened_service=AdminService::new(reopened.clone(),vec![]);
+            assert_eq!(reopened.available_count(),ip_count as usize);
+            for id in &ids {
+                assert_eq!(reopened_service.get_balance(*id).await.unwrap().remaining,1997.0);
+            }
+            if ip_count<5 { reopened.static_ip_import(((ip_count+1)..=5).map(ip).collect()).unwrap(); }
+            assert_eq!(reopened.available_count(),5);
+            assert!(reopened.static_ip_list().entries.iter().all(|ip| ip.credential_ids.len()==1));
+            std::fs::remove_dir_all(dir).unwrap();
+        }}
+    }
+    #[tokio::test]
+    async fn exhausted_import_is_not_auto_enabled_when_ips_exist() {
+        let m=Arc::new(MultiTokenManager::new(Config::default(),vec![],None,None,true).unwrap());
+        initializer(&m,2000.0);m.static_ip_config(Some(true),None).unwrap();m.static_ip_import(vec![ip(1)]).unwrap();
+        let service=AdminService::new(m.clone(),vec![]);
+        let result=service.import_one_credential(request(0),true).await;
+        let id=result.credential_id.unwrap();
+        assert_eq!(m.clone_credential(id).unwrap().disabled_reason.as_deref(),Some("QuotaExceeded"));
+        assert_eq!(m.available_count(),0);
+        assert!(m.static_ip_list().entries[0].credential_ids.is_empty());
+        m.reconcile_static_ips().unwrap();assert_eq!(m.available_count(),0);
+    }
+    #[tokio::test]
+    async fn failed_initialization_does_not_consume_ip_or_publish_fake_metadata() {
+        let m=Arc::new(MultiTokenManager::new(Config::default(),vec![],None,None,true).unwrap());
+        m.static_ip_config(Some(true),None).unwrap();m.static_ip_import(vec![ip(1)]).unwrap();
+        *m.test_import_initializer.lock()=Some(Arc::new(|_,_|Box::pin(async {anyhow::bail!("quota query failed")})));
+        let service=AdminService::new(m.clone(),vec![]);
+        let result=service.import_one_credential(request(0),true).await;
+        assert!(matches!(result.status,ImportStatus::Failed));
+        assert!(result.credential_id.is_none() && !result.rolled_back);
+        assert_eq!(m.total_count_in_group(None),0);
+        assert!(m.static_ip_list().entries[0].credential_ids.is_empty());
     }
 }

@@ -333,6 +333,8 @@ function getDisabledReasonStyle(reason?: string | null): {
 } | null {
   if (!reason) return null;
   switch (reason) {
+    case "WaitingStaticIp":
+      return { label: "等待静态 IP", variant: "warning" };
     case "QuotaExceeded":
       return { label: "已超额", variant: "warning" };
     case "TooManyFailures":

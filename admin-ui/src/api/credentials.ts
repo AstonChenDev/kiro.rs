@@ -213,7 +213,7 @@ export async function addCredential(
 /** 批量导入 SSE 单条事件（对应请求数组下标 index） */
 export interface BatchImportItemEvent {
   index: number
-  status: 'verified' | 'imported' | 'duplicate' | 'failed'
+  status: 'verified' | 'imported' | 'waiting' | 'duplicate' | 'failed'
   credentialId?: number
   email?: string
   usage?: string
@@ -229,6 +229,7 @@ export interface BatchImportSummary {
   /** 直接导入（未验活）成功数 */
   imported: number
   verified: number
+  waiting?: number
   duplicate: number
   failed: number
   rolledBack: number

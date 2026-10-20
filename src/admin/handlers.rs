@@ -289,6 +289,7 @@ pub async fn batch_import_credentials(
 
         let mut imported = 0_usize;
         let mut verified = 0_usize;
+        let mut waiting = 0_usize;
         let mut duplicate = 0_usize;
         let mut failed = 0_usize;
         let mut rolled_back = 0_usize;
@@ -299,6 +300,7 @@ pub async fn batch_import_credentials(
             match event.status.as_str() {
                 "imported" => imported += 1,
                 "verified" => verified += 1,
+                "waiting" => waiting += 1,
                 "duplicate" => duplicate += 1,
                 "failed" => {
                     failed += 1;
@@ -311,7 +313,7 @@ pub async fn batch_import_credentials(
             // 客户端断开（abort / 关闭连接）→ 接收端随响应体被 drop，send 失败：
             // 停止处理剩余凭据。break 会丢弃 buffer_unordered 内 in-flight 的 future。
             if tx.unbounded_send(event).is_err() {
-                let processed = imported + verified + duplicate + failed;
+                let processed = imported + verified + waiting + duplicate + failed;
                 tracing::info!(
                     "批量导入被客户端中断，停止剩余凭据（已完成 {}/{}）",
                     processed,
@@ -337,6 +339,7 @@ pub async fn batch_import_credentials(
                     total,
                     imported,
                     verified,
+                    waiting,
                     duplicate,
                     failed,
                     rolled_back,

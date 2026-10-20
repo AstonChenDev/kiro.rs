@@ -1,3 +1,4 @@
+import { importedSubscriptionTitle } from '@/lib/credential-import'
 import { normalizeKamAccount } from '@/lib/kam-import'
 import type { CredentialTraffic } from '@/api/traffic'
 import { useState, useMemo, useRef } from 'react'
@@ -29,6 +30,8 @@ interface KamImportDialogProps {
 
 // KAM 导出 JSON 中的账号结构
 interface KamAccount {
+  subscriptionTitle?: string
+  subscription?: { title?: string; type?: string }
   traffic?: Partial<CredentialTraffic>
   email?: string
   userId?: string | null
@@ -73,7 +76,7 @@ function normalizeExpiresAt(value: unknown): string | undefined {
 
 interface VerificationResult {
   index: number
-  status: 'pending' | 'checking' | 'verifying' | 'verified' | 'imported' | 'duplicate' | 'failed' | 'skipped'
+  status: 'pending' | 'checking' | 'verifying' | 'verified' | 'imported' | 'waiting' | 'duplicate' | 'failed' | 'skipped'
   error?: string
   usage?: string
   email?: string
@@ -331,6 +334,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           index: i,
           req: {
             refreshToken: token,
+            subscriptionTitle: importedSubscriptionTitle({ subscriptionTitle: account.subscriptionTitle, subscription: account.subscription }),
             accessToken: cred.accessToken?.trim() || undefined,
             profileArn: cred.profileArn?.trim() || undefined,
             expiresAt: normalizeExpiresAt(cred.expiresAt),
@@ -388,6 +392,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                 credentialId: ev.credentialId,
               })
               setCurrentProcessing(ev.email ? `已导入: ${ev.email}` : '已导入')
+            } else if (ev.status === 'waiting') {
+              updateResult(orig, { status: 'waiting', usage: ev.usage, error: ev.error, email: ev.email, credentialId: ev.credentialId })
+              setCurrentProcessing('已保存，等待静态 IP')
             } else if (ev.status === 'duplicate') {
               updateResult(orig, { status: 'duplicate', error: ev.error || '该凭据已存在' })
             } else {
@@ -399,13 +406,14 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             }
           },
           (s: BatchImportSummary) => {
-            const importedTotal = s.imported + s.verified
+            const waiting = s.waiting ?? 0
+            const importedTotal = s.imported + s.verified + waiting
             if (verify) {
-              if (s.failed === 0 && s.duplicate === 0) {
+              if (s.failed === 0 && s.duplicate === 0 && waiting === 0 && s.imported === 0) {
                 toast.success(`成功导入并验活 ${s.verified} 个凭据`)
               } else {
                 toast.info(
-                  `验活完成：成功 ${s.verified} 个，重复 ${s.duplicate} 个，失败 ${s.failed} 个（已排除 ${s.rolledBack}）`
+                  `导入完成：验活成功 ${s.verified} 个，已保存未验活 ${s.imported} 个，等待静态 IP ${waiting} 个，重复 ${s.duplicate} 个，失败 ${s.failed} 个（已排除 ${s.rolledBack}）`
                 )
                 if (s.rolledBack < s.failed) {
                   toast.warning(`有 ${s.failed - s.rolledBack} 个失败凭据回滚未完成，请手动处理`)
@@ -413,7 +421,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               }
             } else {
               if (s.failed === 0 && s.duplicate === 0) {
-                toast.success(`直接导入 ${importedTotal} 个凭据（未验活）`)
+                toast.success(`已导入 ${importedTotal} 个凭据：已验证 ${s.verified} 个，等待静态 IP ${waiting} 个，未验活 ${s.imported} 个`)
               } else {
                 toast.info(
                   `导入完成：成功 ${importedTotal} 个，重复 ${s.duplicate} 个，失败 ${s.failed} 个`
@@ -452,6 +460,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         return <CheckCircle2 className="w-5 h-5 text-green-500" />
       case 'imported':
         return <CheckCircle2 className="w-5 h-5 text-sky-500" />
+      case 'waiting':
+        return <AlertCircle className="w-5 h-5 text-amber-500" />
       case 'duplicate':
         return <AlertCircle className="w-5 h-5 text-yellow-500" />
       case 'skipped':
@@ -468,6 +478,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       case 'verifying': return '处理中...'
       case 'verified': return '验活成功'
       case 'imported': return '已导入（未验活）'
+      case 'waiting': return '已验证，等待静态 IP（未启用）'
       case 'duplicate': return '重复凭据'
       case 'skipped': return '已跳过（error 状态）'
       case 'failed':
@@ -494,6 +505,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     r =>
       r.status === 'verified' ||
       r.status === 'imported' ||
+      r.status === 'waiting' ||
       r.status === 'duplicate' ||
       r.status === 'failed' ||
       r.status === 'skipped'
@@ -577,6 +589,10 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             </div>
           )}
 
+          <p className="text-xs text-muted-foreground">
+            自动分配静态 IP 的个人账号先保存、不在导入时验活；无 IP 时保持未启用，获得 IP 后自动启用。
+          </p>
+
           {/* 导入进度和结果 */}
           {(importing || results.length > 0) && (
             <>
@@ -604,6 +620,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                   ✓ 已导入: {results.filter(r => r.status === 'imported').length}
                 </span>
                 <span className="text-yellow-600 dark:text-yellow-400">
+                  ◔ 等待静态 IP: {results.filter(r => r.status === 'waiting').length} ·
                   ⚠ 重复: {results.filter(r => r.status === 'duplicate').length}
                 </span>
                 <span className="text-red-600 dark:text-red-400">
@@ -632,10 +649,10 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                           <div className="text-xs text-muted-foreground mt-1">用量: {result.usage}</div>
                         )}
                         {result.error && (
-                          <div className="text-xs text-red-600 dark:text-red-400 mt-1">{result.error}</div>
+                          <div className={`text-xs mt-1 ${result.status === 'waiting' ? 'text-amber-600 dark:text-amber-400' : 'text-red-600 dark:text-red-400'}`}>{result.error}</div>
                         )}
                         {result.rollbackError && (
-                          <div className="text-xs text-red-600 dark:text-red-400 mt-1">回滚失败: {result.rollbackError}</div>
+                          <div className={`text-xs mt-1 ${result.status === 'waiting' ? 'text-amber-600 dark:text-amber-400' : 'text-red-600 dark:text-red-400'}`}>回滚失败: {result.rollbackError}</div>
                         )}
                       </div>
                     </div>

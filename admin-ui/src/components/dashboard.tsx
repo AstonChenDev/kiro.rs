@@ -2371,6 +2371,14 @@ function DashboardContent({ onLogout, embedded = false }: DashboardProps) {
                 hint: "额度用尽，需等重置或开启超额",
               },
               {
+                label: "等待静态 IP",
+                count: stateCounts.waiting,
+                tone: "warn",
+                active: stateFilter === "waiting",
+                onClick: () => setStateFilter("waiting"),
+                hint: "凭据已保存但未启用，空闲 IP 到位后自动绑定并启用",
+              },
+              {
                 label: "禁用",
                 count: stateCounts.dead,
                 tone: "dead",

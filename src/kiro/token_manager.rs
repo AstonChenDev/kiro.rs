@@ -9,6 +9,51 @@ use crate::kiro::model::credentials::InvalidCredentialConfig;
 #[error("流量策略保存失败: {0}")]
 pub(crate) struct TrafficStorageError(pub anyhow::Error);
 
+#[derive(Debug, thiserror::Error)]
+#[error("{stage}网络请求失败：{kind}（已尝试 {attempts} 次），请检查网络或代理后重试")]
+pub(crate) struct ImportNetworkError {
+    pub stage: &'static str,
+    pub kind: &'static str,
+    pub attempts: usize,
+    #[source]
+    source: anyhow::Error,
+}
+
+fn import_transport_failure(error: &anyhow::Error) -> Option<&'static str> {
+    if error.downcast_ref::<tokio::time::error::Elapsed>().is_some() { return Some("请求超时"); }
+    let http = error.downcast_ref::<reqwest::Error>()?;
+    if http.is_timeout() { return Some("请求超时"); }
+    if !(http.is_connect() || http.is_request() || http.is_body()) { return None; }
+    // Inspect causes only to select a fixed, safe diagnostic. Never log request
+    // bodies, credentials, proxy URLs, or arbitrary upstream text.
+    let causes = error.chain().map(|e| e.to_string().to_lowercase()).collect::<Vec<_>>().join(" ");
+    Some(if causes.contains("dns") || causes.contains("resolve") { "DNS 解析失败" }
+        else if causes.contains("tls") || causes.contains("certificate") || causes.contains("handshake") { "TLS 握手失败" }
+        else if causes.contains("reset") || causes.contains("closed") || causes.contains("eof") { "连接中断" }
+        else if causes.contains("refused") { "连接被拒绝" }
+        else { "网络连接失败" })
+}
+
+async fn retry_import_network<T, F, Fut>(stage: &'static str, mut request: F) -> anyhow::Result<T>
+where F: FnMut() -> Fut, Fut: std::future::Future<Output = anyhow::Result<T>> {
+    for attempt in 1..=3 {
+        let result = match tokio::time::timeout(StdDuration::from_secs(45), request()).await {
+            Ok(result) => result,
+            Err(error) => Err(error.into()),
+        };
+        match result {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let Some(kind) = import_transport_failure(&error) else { return Err(error); };
+                tracing::warn!(stage, kind, attempt, "导入网络请求失败");
+                if attempt == 3 { return Err(ImportNetworkError { stage, kind, attempts: attempt, source: error }.into()); }
+                tokio::time::sleep(StdDuration::from_millis(500 * attempt as u64)).await;
+            }
+        }
+    }
+    unreachable!()
+}
+
 #[path = "static_ips.rs"]
 pub mod static_ips;
 use static_ips::StaticIpStore;
@@ -1084,6 +1129,8 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+    /// 已保存，等待独占静态 IP；自动绑定后启用。
+    WaitingStaticIp,
 }
 
 impl DisabledReason {
@@ -1096,6 +1143,7 @@ impl DisabledReason {
             Self::QuotaExceeded => "QuotaExceeded",
             Self::InvalidRefreshToken => "InvalidRefreshToken",
             Self::InvalidConfig => "InvalidConfig",
+            Self::WaitingStaticIp => "WaitingStaticIp",
         }
     }
 
@@ -1108,6 +1156,7 @@ impl DisabledReason {
             "QuotaExceeded" => Some(Self::QuotaExceeded),
             "InvalidRefreshToken" => Some(Self::InvalidRefreshToken),
             "InvalidConfig" => Some(Self::InvalidConfig),
+            "WaitingStaticIp" => Some(Self::WaitingStaticIp),
             _ => None,
         }
     }
@@ -1325,7 +1374,20 @@ pub struct MultiTokenManager {
     /// 测试替身：替换 ListAvailableModels 的上游请求，使模型缓存相关测试不走网络。
     #[cfg(test)]
     test_models_fetcher: Mutex<Option<TestModelsFetcher>>,
+    #[cfg(test)]
+    pub(crate) test_import_initializer: Mutex<Option<TestImportInitializer>>,
 }
+
+/// Keep allocation blocked until the admin service has persisted the initial balance.
+pub(crate) struct CredentialImport {
+    pub id: u64,
+    pub usage: Option<UsageLimitsResponse>,
+    pub allocation_guard: Option<static_ips::StaticIpLease>,
+}
+
+#[cfg(test)]
+pub(crate) type TestImportInitializer = Arc<dyn Fn(KiroCredentials, Option<ProxyConfig>)
+    -> futures::future::BoxFuture<'static, anyhow::Result<(KiroCredentials, UsageLimitsResponse)>> + Send + Sync>;
 
 #[cfg(test)]
 type TestModelsFetcher = Arc<
@@ -1589,6 +1651,8 @@ impl MultiTokenManager {
             model_cache_epoch: AtomicU64::new(0),
             #[cfg(test)]
             test_models_fetcher: Mutex::new(None),
+            #[cfg(test)]
+            test_import_initializer: Mutex::new(None),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -1979,8 +2043,9 @@ impl MultiTokenManager {
         let default_rpm = if self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
             self.account_rpm_limit.load(Ordering::Relaxed)
         } else { 0 };
-        self.traffic_policies.lock().resolve(&entry.credentials.traffic,
-            entry.credentials.subscription_title.as_deref(), default_rpm)
+        self.traffic_policies.lock().resolve_for_type(&entry.credentials.traffic,
+            entry.credentials.subscription_title.as_deref(), default_rpm,
+            super::traffic::AccountType::detect(&entry.credentials))
     }
 
     fn concurrency_exceeded(&self, entry: &CredentialEntry) -> bool {
@@ -2207,7 +2272,10 @@ impl MultiTokenManager {
             .ok_or_else(|| anyhow::anyhow!("凭据不存在: {id}"))?;
         anyhow::ensure!(entries[index].traffic_balance_identity() == identity,
             "账号认证信息已变化，请重新刷新额度");
-        if !disable || entries[index].disabled { return Ok(()); }
+        // Waiting for an IP is not an account-health failure. A newly fetched
+        // exhausted balance must replace it, so allocation cannot re-enable it.
+        if !disable || (entries[index].disabled
+            && entries[index].disabled_reason != Some(DisabledReason::WaitingStaticIp)) { return Ok(()); }
         let mut snapshot: Vec<_> = entries.iter().map(CredentialEntry::credentials_snapshot).collect();
         snapshot[index].disabled = true;
         snapshot[index].disabled_reason = Some("QuotaExceeded".into());
@@ -2239,6 +2307,17 @@ impl MultiTokenManager {
             let limits = policies.tiers.entry(tier).or_default();
             if let Some(value) = patch.concurrency { limits.concurrency = value; }
             if let Some(value) = patch.rpm { limits.rpm = value; }
+        }
+        for (account_type, patch) in patch.account_types {
+            let policy = policies.account_types.entry(account_type).or_default();
+            if let Some(value) = patch.defaults.concurrency { policy.defaults.concurrency = value; }
+            if let Some(value) = patch.defaults.rpm { policy.defaults.rpm = value; }
+            for (tier, patch) in patch.tiers {
+                if patch.concurrency.is_none() && patch.rpm.is_none() { continue; }
+                let limits = policy.tiers.entry(tier).or_default();
+                if let Some(value) = patch.concurrency { limits.concurrency = value; }
+                if let Some(value) = patch.rpm { limits.rpm = value; }
+            }
         }
         if let Some(value) = patch.default_concurrency { policies.default_concurrency = value; }
         if let Some(value) = patch.auto_disable_quota { policies.auto_disable_quota = value; }
@@ -2521,7 +2600,7 @@ impl MultiTokenManager {
                     // 注意：必须在 bail! 之前计算 available_count，
                     // 因为 available_count() 会尝试获取 entries 锁，
                     // 而此时我们已经持有该锁，会导致死锁
-                    if entries.iter().any(|e| !e.disabled && e.credentials.static_ip_required && e.credentials.proxy_url.is_none() && credential_matches_request(&e.credentials, model, group)) {
+                    if entries.iter().any(|e| (!e.disabled || e.disabled_reason == Some(DisabledReason::WaitingStaticIp)) && e.credentials.static_ip_required && e.credentials.proxy_url.is_none() && credential_matches_request(&e.credentials, model, group)) {
                         return Err(static_ips::StaticIpError("账号等待空闲静态 IP，请补充 IP 后重试".into()).into());
                     }
                     if let Some(error) = entries.iter()
@@ -4363,19 +4442,44 @@ impl MultiTokenManager {
     /// # 流程
     /// 1. 验证凭据基本字段（API Key: kiroApiKey 不为空; OAuth: refreshToken 不为空）
     /// 2. 基于 kiroApiKey 或 refreshToken 的 SHA-256 哈希检测重复
-    /// 3. OAuth: 尝试刷新 Token 验证凭据有效性; API Key: 跳过
-    /// 4. 分配新 ID（当前最大 ID + 1）
+    /// 3. OAuth: 正常刷新 Token；自动分配静态 IP 的账号同时获取初始订阅和额度；API Key 不刷新 Token
+    /// 4. 分配单调递增的新 ID
     /// 5. 添加到 entries 列表
     /// 6. 持久化到配置文件
     ///
     /// # 返回
     /// - `Ok(u64)` - 新凭据 ID
     /// - `Err(_)` - 验证失败或添加失败
+    #[cfg(test)]
     pub async fn add_credential(self: &Arc<Self>, new_cred: KiroCredentials) -> anyhow::Result<u64> {
         self.add_credential_with_proxy_origin(new_cred, false).await
     }
 
-    pub(crate) async fn add_credential_with_proxy_origin(self: &Arc<Self>, mut new_cred: KiroCredentials, proxy_auto_assigned: bool) -> anyhow::Result<u64> {
+    #[cfg(test)]
+    pub(crate) async fn add_credential_with_proxy_origin(self: &Arc<Self>, new_cred: KiroCredentials, proxy_auto_assigned: bool) -> anyhow::Result<u64> {
+        let imported = self.import_credential_with_metadata(new_cred, proxy_auto_assigned).await?;
+        let id = imported.id;
+        drop(imported);
+        self.reconcile_static_ips_logged();
+        Ok(id)
+    }
+
+    async fn initialize_personal_import(&self, credentials: &KiroCredentials, proxy: Option<&ProxyConfig>)
+        -> anyhow::Result<(KiroCredentials, UsageLimitsResponse)> {
+        #[cfg(test)]
+        {
+            let initializer = self.test_import_initializer.lock().clone();
+            if let Some(initializer) = initializer {
+                return initializer(credentials.clone(), proxy.cloned()).await;
+            }
+        }
+        let refreshed = retry_import_network("刷新 Token", || refresh_token(credentials, &self.config, proxy)).await?;
+        let token = refreshed.access_token.as_deref().ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?;
+        let usage = retry_import_network("查询订阅和额度", || get_usage_limits(&refreshed, &self.config, token, proxy)).await?;
+        Ok((refreshed, usage))
+    }
+
+    pub(crate) async fn import_credential_with_metadata(self: &Arc<Self>, mut new_cred: KiroCredentials, proxy_auto_assigned: bool) -> anyhow::Result<CredentialImport> {
         // 1. 基本验证
         new_cred.traffic.validate()?;
         if new_cred.is_api_key_credential() {
@@ -4435,11 +4539,18 @@ impl MultiTokenManager {
             }
         }
 
-        // Pin the chosen proxy before validation, including ordinary/shared proxies.
-        // Drop releases the import guard on success, failure or cancellation.
-        let static_reservation = self.prepare_static_ip_with_proxy_origin(&mut new_cred, proxy_auto_assigned)?;
+        // Determine eligibility without changing the normal import route. Static IPs
+        // control scheduling only AFTER refresh and the initial subscription/quota query.
+        let mut post_import = new_cred.clone();
+        let queued_static_ip = self.queue_static_ip_import(&mut post_import, proxy_auto_assigned);
+        let static_reservation = if queued_static_ip {
+            self.prepare_normal_import(&new_cred)?
+        } else {
+            self.prepare_static_ip_with_proxy_origin(&mut new_cred, proxy_auto_assigned)?
+        };
 
         // 3. 验证凭据有效性（API Key 无需网络刷新）
+        let mut initial_usage = None;
         let mut validated_cred = if new_cred.is_api_key_credential() {
             new_cred.clone()
         } else {
@@ -4449,8 +4560,20 @@ impl MultiTokenManager {
                 Some(self.prepare_proxy_use(&new_cred, effective_proxy).await?)
             } else { None };
             let network_proxy = domain_guard.as_ref().and_then(|guard| guard.proxy()).or(effective_proxy);
-            refresh_token(&new_cred, &self.config, network_proxy).await?
+            if queued_static_ip {
+                let (credentials, usage) = self.initialize_personal_import(&new_cred, network_proxy).await?;
+                initial_usage = Some(usage);
+                credentials
+            } else {
+                retry_import_network("刷新 Token", || refresh_token(&new_cred, &self.config, network_proxy)).await?
+            }
         };
+        if queued_static_ip {
+            new_cred.static_ip_required = true;
+            new_cred.proxy_url = None;
+            new_cred.proxy_username = None;
+            new_cred.proxy_password = None;
+        }
 
         // 捕获原始输入的去重指纹。刷新可能轮换 refreshToken，且下方 step 5 会把
         // new_cred 的字段 move 走，故必须在此处（字段尚完整时）取指纹，
@@ -4492,6 +4615,17 @@ impl MultiTokenManager {
         validated_cred.api_region = new_cred.api_region;
         validated_cred.machine_id = new_cred.machine_id;
         validated_cred.email = new_cred.email;
+        if validated_cred.subscription_title.is_none() {
+            validated_cred.subscription_title = new_cred.subscription_title;
+        }
+        if let Some(usage) = &initial_usage {
+            if let Some(title) = usage.subscription_title() {
+                validated_cred.subscription_title = Some(title.to_string());
+            }
+            if validated_cred.email.as_deref().is_none_or(|s| s.is_empty()) {
+                validated_cred.email = usage.email().map(str::to_string);
+            }
+        }
         validated_cred.static_ip_required = new_cred.static_ip_required;
         validated_cred.proxy_url = new_cred.proxy_url;
         validated_cred.proxy_username = new_cred.proxy_username;
@@ -4507,6 +4641,12 @@ impl MultiTokenManager {
         }
 
         let exclusive_import = validated_cred.static_ip_required;
+        if queued_static_ip {
+            validated_cred.disabled = true;
+            validated_cred.disabled_reason = Some(DisabledReason::WaitingStaticIp.as_str().into());
+        }
+        let proxy_operations = Arc::new(AtomicU32::new(0));
+        let allocation_guard = queued_static_ip.then(|| static_ips::StaticIpLease::hold(proxy_operations.clone()));
         {
             let store = self.static_ips.lock();
             let _persist = exclusive_import.then(|| self.persist_lock.lock());
@@ -4547,14 +4687,14 @@ impl MultiTokenManager {
                 failure_count: 0,
                 total_failure_count: 0,
                 refresh_failure_count: 0,
-                disabled: false,
-                disabled_reason: None,
+                disabled: queued_static_ip,
+                disabled_reason: queued_static_ip.then_some(DisabledReason::WaitingStaticIp),
                 success_count: 0,
                 last_used_at: None,
                 throttled_until: None,
                 rpm_window: VecDeque::new(),
                     active_requests: Arc::new(AtomicU32::new(0)),
-                    proxy_operations: Arc::new(AtomicU32::new(0)),
+                    proxy_operations,
                 self_heal_consecutive_rounds: 0,
                 self_heal_total_count: 0,
                 last_self_heal_at: None,
@@ -4573,10 +4713,12 @@ impl MultiTokenManager {
 
         // 7. 后台拉取模型列表：入库后它已参与调度，缓存越早就绪，越早避开它
         //    不支持的模型。所有添加路径都经过这里，不必在各调用方重复触发。
-        self.warm_model_cache_for(new_id);
+        if !queued_static_ip {
+            self.warm_model_cache_for(new_id);
+        }
 
         tracing::info!("成功添加凭据 #{}", new_id);
-        Ok(new_id)
+        Ok(CredentialImport { id: new_id, usage: initial_usage, allocation_guard })
     }
 
     /// 更新凭据的可编辑字段（Admin API）
@@ -5502,6 +5644,41 @@ mod tests {
         assert_eq!((status[1].effective.concurrency, status[1].effective.rpm), (200, 80));
         restarted.set_credential_traffic(1, Default::default()).unwrap();
         assert_eq!(restarted.traffic_status()[0].effective.rpm, 80);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn typed_traffic_enforces_limits_and_persists_nested_patches() {
+        use crate::kiro::traffic::AccountType;
+        let (dir, path) = issue51_credentials_path("typed_traffic");
+        let config_path = dir.join("config.json");
+        let config = Config::load(&config_path).unwrap(); config.save().unwrap();
+        let credential = |id, provider: &str| KiroCredentials { id: Some(id), provider: Some(provider.into()), auth_method: Some("social".into()), subscription_title: Some("KIRO PRO MAX".into()), ..Default::default() };
+        let manager = MultiTokenManager::new(config, vec![credential(1,"Google"),credential(2,"GitHub")], None, Some(path.clone()), true).unwrap();
+        let patch = |value| manager.patch_traffic_policies(serde_json::from_value(value).unwrap());
+        patch(serde_json::json!({"tiers":{"max":{"concurrency":5,"rpm":50}},"accountTypes":{"google":{"defaults":{"rpm":2},"tiers":{"max":{"concurrency":1}}}}})).unwrap();
+        let p = manager.try_acquire_permit(1).unwrap();
+        assert!(manager.try_acquire_permit(1).is_none()); // Typed concurrency, not common tier's 5.
+        assert!(manager.try_acquire_permit(2).is_some());
+        drop(p);
+        drop(manager.try_acquire_permit(1).unwrap());
+        assert!(manager.try_acquire_permit(1).is_none()); // Typed RPM, not common tier's 50.
+        patch(serde_json::json!({"accountTypes":{"google":{"tiers":{"max":{"rpm":0}}}}})).unwrap();
+        assert!(manager.try_acquire_permit(1).is_some()); // Zero overrides default RPM.
+        patch(serde_json::json!({"accountTypes":{"google":{"tiers":{"max":{"concurrency":null}}}}})).unwrap();
+        assert_eq!(manager.traffic_status()[0].effective.concurrency,5);
+        let before=serde_json::to_value(manager.traffic_policies()).unwrap();
+        assert!(patch(serde_json::json!({"autoDisableQuota":false,"accountTypes":{"google":{"defaults":{"rpm":100001}}}})).is_err());
+        assert_eq!(serde_json::to_value(manager.traffic_policies()).unwrap(),before);
+        manager.set_credential_traffic(1,CredentialTraffic { concurrency:Some(7),rpm:Some(9),..Default::default() }).unwrap();
+        let mut credentials: Vec<KiroCredentials> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        credentials.push(credential(3,"Google"));
+        let restarted=MultiTokenManager::new(Config::load(&config_path).unwrap(),credentials,None,Some(path),true).unwrap();
+        let rows=restarted.traffic_status();
+        assert_eq!((rows[0].effective.concurrency,rows[0].effective.rpm),(7,9));
+        assert_eq!((rows[1].effective.concurrency,rows[1].effective.rpm),(5,50));
+        assert_eq!((rows[2].effective.concurrency,rows[2].effective.rpm),(5,0));
+        assert_eq!(rows[2].effective.account_type,AccountType::Google);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -8901,4 +9078,52 @@ mod custom_audit_credential_regressions {
         assert_eq!(m.static_ip_list().entries[0].status,"occupied");
     }
 
+}
+
+#[cfg(test)]
+mod import_network_retry_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn interrupted_connections_retry_without_changing_route_then_succeed() {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url=format!("http://{}/refreshToken",listener.local_addr().unwrap());
+        let server=tokio::spawn(async move {
+            for attempt in 1..=3 {
+                let (mut socket,_)=listener.accept().await.unwrap();
+                let mut buf=[0u8;2048];let n=socket.read(&mut buf).await.unwrap();
+                assert!(String::from_utf8_lossy(&buf[..n]).contains("/refreshToken"));
+                if attempt==3 {socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK").await.unwrap();}
+            }
+        });
+        let mut calls=0;
+        let response=retry_import_network("刷新 Token",||{
+            calls+=1;let url=url.clone();
+            async move { Ok(reqwest::Client::builder().no_proxy().build().unwrap().post(url).body("fixture").send().await?) }
+        }).await.unwrap();
+        assert_eq!(response.status(),reqwest::StatusCode::OK);
+        assert_eq!(calls,3);server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn permanent_credential_failures_are_not_retried() {
+        let mut calls=0;
+        let error=retry_import_network::<(),_,_>("刷新 Token",||{
+            calls+=1;async {Err(RefreshTokenInvalidError {message:"fixture invalid_grant".into()}.into())}
+        }).await.unwrap_err();
+        assert_eq!(calls,1);assert!(error.downcast_ref::<RefreshTokenInvalidError>().is_some());
+    }
+    #[tokio::test]
+    async fn persistent_connection_failure_is_bounded_and_returns_safe_diagnostic() {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url=format!("http://{}/secret-path?token=fixture-secret",listener.local_addr().unwrap());drop(listener);
+        let mut calls=0;
+        let error=retry_import_network("刷新 Token",||{
+            calls+=1;let url=url.clone();
+            async move {Ok(reqwest::Client::builder().no_proxy().build().unwrap().post(url).send().await?)}
+        }).await.unwrap_err();
+        assert_eq!(calls,3);let error=error.downcast_ref::<ImportNetworkError>().unwrap();
+        assert_eq!(error.attempts,3);assert_eq!(error.kind,"连接被拒绝");
+        assert!(!error.to_string().contains("fixture-secret"));
+    }
 }

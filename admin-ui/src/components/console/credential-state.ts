@@ -24,6 +24,7 @@ export type CredentialState =
   | 'authFailed' // 鉴权 / token 失效类禁用
   | 'suspended' // 账号封禁
   | 'refreshFailing' // token 刷新在失败，但还没到禁用阈值
+  | 'waitingStaticIp' // 已保存，等待空闲静态 IP
   | 'manualDisabled' // 手动禁用
   | 'otherDisabled' // 其他原因禁用
   | 'healthy'
@@ -76,6 +77,9 @@ export function getDisposition(
   const reason = c.disabledReason
 
   if (c.disabled) {
+    if (reason === 'WaitingStaticIp') {
+      return { state: 'waitingStaticIp', tone: 'warn', stateLabel: '等待静态 IP · 未启用', actionLabel: null, action: 'none' }
+    }
     if (reason === 'QuotaExceeded') {
       return {
         state: 'quotaDisabled',
@@ -194,6 +198,7 @@ export interface CredentialCounts {
   current: number
   throttled: number
   quota: number
+  waiting: number
   dead: number
   total: number
 }
@@ -207,6 +212,7 @@ export function countByState(
     current: 0,
     throttled: 0,
     quota: 0,
+    waiting: 0,
     dead: 0,
     total: credentials.length,
   }
@@ -220,6 +226,9 @@ export function countByState(
       case 'healthy':
       case 'refreshFailing':
         counts.healthy += 1
+        break
+      case 'waitingStaticIp':
+        counts.waiting += 1
         break
       case 'throttled':
         counts.throttled += 1
@@ -236,7 +245,7 @@ export function countByState(
 }
 
 /** 状态账条各段对应的筛选键 */
-export type StateFilter = '' | 'healthy' | 'throttled' | 'quota' | 'dead'
+export type StateFilter = '' | 'healthy' | 'throttled' | 'quota' | 'waiting' | 'dead'
 
 /** 某凭据是否命中状态筛选 */
 export function matchesStateFilter(
@@ -253,6 +262,8 @@ export function matchesStateFilter(
       return state === 'throttled'
     case 'quota':
       return state === 'quotaExceeded' || state === 'quotaDisabled'
+    case 'waiting':
+      return state === 'waitingStaticIp'
     case 'dead':
       return (
         state === 'authFailed' ||

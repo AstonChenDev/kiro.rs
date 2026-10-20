@@ -48,6 +48,10 @@ pub fn personal_provider(c: &KiroCredentials) -> Option<&'static str> {
 fn eligible(inventory: &Inventory, c: &KiroCredentials) -> bool {
     personal_provider(c).is_some_and(|p| inventory.allowed_providers.iter().any(|v| v == p))
 }
+fn waiting_for_static_ip(e: &CredentialEntry) -> bool {
+    e.disabled_reason == Some(DisabledReason::WaitingStaticIp)
+        && e.credentials.static_ip_required && e.credentials.proxy_url.is_none()
+}
 fn proxy_busy(e: &CredentialEntry) -> bool {
     e.active_requests.load(Ordering::Acquire) > 0 || e.proxy_operations.load(Ordering::Acquire) > 0
 }
@@ -69,6 +73,12 @@ pub(super) fn check_static_binding(store: &StaticIpStore, entries: &[CredentialE
 /// Pins an account's proxy across token refresh, context preparation and admin queries.
 #[derive(Clone)]
 pub struct StaticIpLease { _counter: Arc<LeaseCounter> }
+impl StaticIpLease {
+    pub(super) fn hold(counter: Arc<AtomicU32>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self { _counter: Arc::new(LeaseCounter(counter)) }
+    }
+}
 /// Pins the actual proxy host until its network operation/body has finished.
 /// Weak inventory entries do not keep requests alive; dropping never takes a lock.
 pub(crate) struct ProxyUse {
@@ -236,7 +246,9 @@ impl Drop for Reservation {
 /// Called while holding inventory -> persistence (for static imports) -> entries.
 pub(super) fn validate_import_commit(store: &StaticIpStore, entries: &[CredentialEntry], cred: &KiroCredentials, reservation: Option<&Reservation>) -> anyhow::Result<()> {
     if !store.contains(cred.proxy_url.as_deref()) {
-        if cred.static_ip_required { return Err(invalid("静态 IP 绑定已变化，账号未导入，请重试")); }
+        if cred.static_ip_required && (cred.proxy_url.is_some() || !eligible(&store.inventory, cred)) {
+            return Err(invalid("静态 IP 绑定或类型策略已变化，账号未导入，请重试"));
+        }
         return Ok(());
     }
     let key = cred.proxy_url.as_deref().and_then(endpoint_key).unwrap();
@@ -334,7 +346,7 @@ impl MultiTokenManager {
         }
         Ok(())
     }
-    pub(super) fn reconcile_static_ips_logged(&self) {
+    pub(crate) fn reconcile_static_ips_logged(&self) {
         if let Err(error) = self.reconcile_static_ips() { tracing::warn!(%error, "静态 IP 状态同步失败，保留占用并稍后重试"); }
     }
     pub fn reconcile_static_ips(&self) -> anyhow::Result<()> {
@@ -354,7 +366,7 @@ impl MultiTokenManager {
                 c.static_ip_required=allowed; changed=true;
             } else if managed && allowed && !c.static_ip_required {
                 c.static_ip_required=true; changed=true;
-            } else if !managed && c.static_ip_required && !allowed && !proxy_busy(e) {
+            } else if !managed && c.static_ip_required && !allowed && !waiting_for_static_ip(e) && !proxy_busy(e) {
                 c.static_ip_required=false; changed=true;
             }
             // Repair already-bound accounts written by the old static input path.
@@ -366,19 +378,33 @@ impl MultiTokenManager {
         }
         let mut used: HashSet<_> = snapshot.iter().filter_map(|c| c.proxy_url.as_deref().and_then(endpoint_key)).collect();
         for (e, c) in entries.iter().zip(snapshot.iter_mut()) {
-            if c.static_ip_required && c.proxy_url.is_none() && (!e.disabled || probe==Some(e.id)) && eligible(&store.inventory, c) && !proxy_busy(e) {
+            if c.static_ip_required && c.proxy_url.is_none() && (!e.disabled || probe==Some(e.id) || waiting_for_static_ip(e)) && eligible(&store.inventory, c) && !proxy_busy(e) {
                 if let Some(ip) = store.inventory.entries.iter().find(|ip| {
                     let key=endpoint_key(&ip.url).unwrap();
                     ip.enabled && !used.contains(&key) && !store.reserved.contains(&key) && !self.static_is_global(&key)
                 }) {
                     used.insert(endpoint_key(&ip.url).unwrap());
                     c.proxy_url=Some(ip.url.clone()); c.proxy_username=ip.username.clone(); c.proxy_password=ip.password.clone(); changed=true;
+                    if waiting_for_static_ip(e) {
+                        c.disabled=false; c.disabled_reason=None;
+                    }
                 }
+            }
+        }
+        for (e, c) in entries.iter().zip(snapshot.iter_mut()) {
+            if !c.disabled && c.static_ip_required && c.proxy_url.is_none() && !proxy_busy(e) {
+                c.disabled = true;
+                c.disabled_reason = Some(DisabledReason::WaitingStaticIp.as_str().into());
+                changed = true;
             }
         }
         if changed {
             self.save_traffic_credentials(&snapshot)?;
-            for (entry, c) in entries.iter_mut().zip(snapshot) { entry.credentials=c; }
+            for (entry, c) in entries.iter_mut().zip(snapshot) {
+                entry.disabled=c.disabled;
+                entry.disabled_reason=c.disabled_reason.as_deref().and_then(DisabledReason::from_str);
+                entry.credentials=c;
+            }
         }
         Ok(())
     }
@@ -428,7 +454,7 @@ impl MultiTokenManager {
                 label:e.label.clone(), enabled:e.enabled, status, credential_ids:users }
         }).collect();
         StaticIpResponse { auto_assign: store.inventory.auto_assign, allowed_providers: store.inventory.allowed_providers.clone(),
-            waiting_credential_ids: self.entries.lock().iter().filter(|e| !e.disabled && e.credentials.static_ip_required && e.credentials.proxy_url.is_none()).map(|e| e.id).collect(), entries }
+            waiting_credential_ids: self.entries.lock().iter().filter(|e| (!e.disabled || waiting_for_static_ip(e)) && e.credentials.static_ip_required && e.credentials.proxy_url.is_none()).map(|e| e.id).collect(), entries }
     }
     pub fn static_ip_import(&self, inputs: Vec<StaticIpInput>) -> anyhow::Result<()> {
         if inputs.is_empty() || inputs.len() > 1000 { return Err(invalid("每次请导入 1～1000 条静态 IP")); }
@@ -454,7 +480,11 @@ impl MultiTokenManager {
             }
             next.entries.push(entry);
         }
-        store.save(next)
+        store.save(next)?;
+        drop(credentials);
+        drop(store);
+        self.reconcile_static_ips_logged();
+        Ok(())
     }
     #[cfg(test)]
     pub fn static_ip_auto_assign(&self, enabled: bool) -> anyhow::Result<()> {
@@ -464,7 +494,10 @@ impl MultiTokenManager {
         let mut store = self.static_ips.lock(); let mut next = store.inventory.clone();
         let e = next.entries.iter_mut().find(|e| e.id==id).ok_or_else(|| invalid("静态 IP 不存在"))?;
         // Availability only affects new allocation; existing bindings remain stable.
-        e.enabled=enabled; store.save(next)
+        e.enabled=enabled; store.save(next)?;
+        drop(store);
+        self.reconcile_static_ips_logged();
+        Ok(())
     }
     pub fn static_ip_delete(&self, id: u64) -> anyhow::Result<()> {
         let mut store = self.static_ips.lock(); let mut next = store.inventory.clone();
@@ -475,6 +508,24 @@ impl MultiTokenManager {
         }
         next.entries.retain(|e| e.id!=id); store.save(next)
     }
+    /// Select the post-import policy; callers must initialize account metadata first.
+    /// Explicit ordinary proxies/direct and non-personal identities retain their import path.
+    pub(super) fn queue_static_ip_import(&self, cred: &mut KiroCredentials, proxy_auto_assigned: bool) -> bool {
+        let store = self.static_ips.lock();
+        let explicit = cred.proxy_url.as_deref().is_some_and(|url| !url.trim().is_empty());
+        if !store.inventory.auto_assign || !eligible(&store.inventory, cred)
+            || (explicit && !proxy_auto_assigned) {
+            return false;
+        }
+        cred.static_ip_required = true;
+        cred.proxy_url = None;
+        cred.proxy_username = None;
+        cred.proxy_password = None;
+        true
+    }
+    pub(crate) fn is_waiting_static_ip(&self, id: u64) -> bool {
+        self.entries.lock().iter().any(|e| e.id == id && waiting_for_static_ip(e))
+    }
     /// Called before token validation so even the first refresh uses the assigned proxy.
     fn reserve_ordinary_import(self: &Arc<Self>, store: &mut StaticIpStore, cred: &KiroCredentials) -> anyhow::Result<Option<Reservation>> {
         let Some(proxy) = cred.effective_proxy(self.proxy.lock().as_ref()) else { return Ok(None); };
@@ -482,6 +533,9 @@ impl MultiTokenManager {
         let key = endpoint_key(&proxy.url);
         if let Some(key) = &key { *store.ordinary_imports.entry(key.clone()).or_default() += 1; }
         Ok(Some(Reservation { manager:self.clone(), key, exclusive:false, proxy }))
+    }
+    pub(super) fn prepare_normal_import(self: &Arc<Self>, cred: &KiroCredentials) -> anyhow::Result<Option<Reservation>> {
+        self.reserve_ordinary_import(&mut self.static_ips.lock(), cred)
     }
     #[cfg(test)]
     pub(super) fn prepare_static_ip(self: &Arc<Self>, cred: &mut KiroCredentials) -> anyhow::Result<Option<Reservation>> {
@@ -605,11 +659,20 @@ impl MultiTokenManager {
                     before.static_ip_required
                 } else { store.contains(candidate.proxy_url.as_deref()) };
             }
+            // Explicitly choosing an ordinary proxy/direct resolves this one waiting reason.
+            // Metadata edits and manually disabled accounts must not become enabled.
+            if proxy_changed && waiting_for_static_ip(entry) && !candidate.static_ip_required {
+                candidate.disabled=false;
+                candidate.disabled_reason=None;
+            }
             if managed {
                 let snapshot: Vec<_> = entries.iter().map(|e| if e.id==id { candidate.clone() } else { e.credentials_snapshot() }).collect();
                 self.save_traffic_credentials(&snapshot)?;
             }
-            entries.iter_mut().find(|e| e.id==id).unwrap().credentials=candidate;
+            let entry=entries.iter_mut().find(|e| e.id==id).unwrap();
+            entry.disabled=candidate.disabled;
+            entry.disabled_reason=candidate.disabled_reason.as_deref().and_then(DisabledReason::from_str);
+            entry.credentials=candidate;
         }
         if proxy_changed { self.invalidate_model_cache(id); }
         if !managed { self.persist_credentials()?; }
@@ -656,7 +719,14 @@ mod tests {
         KiroCredentials { refresh_token:Some(name.repeat(120)), access_token:Some("test-access".into()), expires_at:Some("2099-01-01T00:00:00Z".into()), auth_method:Some("social".into()), provider:Some("Github".into()), ..Default::default() }
     }
     fn manager(path: Option<PathBuf>, creds: Vec<KiroCredentials>) -> Arc<MultiTokenManager> {
-        Arc::new(MultiTokenManager::new(Config::default(),creds,None,path,true).unwrap())
+        let manager = Arc::new(MultiTokenManager::new(Config::default(),creds,None,path,true).unwrap());
+        *manager.test_import_initializer.lock() = Some(Arc::new(|c, _| Box::pin(async move {
+            Ok((c, serde_json::from_value(serde_json::json!({
+                "subscriptionInfo":{"subscriptionTitle":"KIRO PRO+"},
+                "usageBreakdownList":[{"usageLimitWithPrecision":2000,"currentUsage":3}]
+            })).unwrap()))
+        })));
+        manager
     }
     impl MultiTokenManager {
         async fn insert_test_personal(self: &Arc<Self>, mut c: KiroCredentials) -> anyhow::Result<u64> {
@@ -736,6 +806,8 @@ mod tests {
         let mut c=account("existing");c.id=Some(1);c.proxy_url=Some("http://192.0.2.10:3000".into());c.proxy_username=Some("fixture-user".into());
         let m=manager(None,vec![c]);
         m.static_ip_import(vec![StaticIpInput{username:Some("fixture-user".into()),password:None,..input("192.0.2.10")}]).unwrap();
+        // Inventory import now reconciles immediately; recreate the legacy missing-password state.
+        m.entries.lock()[0].credentials.proxy_password=None;
         m.entries.lock()[0].proxy_operations.store(1,Ordering::Release);
         m.reconcile_static_ips().unwrap();assert!(m.clone_credential(1).unwrap().proxy_password.is_none());
         m.entries.lock()[0].proxy_operations.store(0,Ordering::Release);
@@ -1694,5 +1766,175 @@ async fn hostname_proxy_cannot_use_managed_ip_and_pins_all_addresses() {
         assert!(result.err().unwrap().downcast_ref::<StaticIpError>().is_some());
     }
 }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=2)]
+    async fn initialized_personal_imports_wait_durably_then_activate() {
+        let dir=temp_dir(); let path=dir.join("credentials.json");
+        let m=manager(Some(path.clone()),vec![]);
+        m.static_ip_auto_assign(true).unwrap();
+        let first=m.add_credential(account("queued-first")).await.unwrap();
+        let second=m.add_credential(account("queued-second")).await.unwrap();
+        assert!(m.is_waiting_static_ip(first) && m.is_waiting_static_ip(second));
+        assert!(m.try_acquire_permit(first).is_none());
+        assert!(m.static_ip_lease(first).is_err());
+        assert!(m.acquire_context(None,None).await.err().unwrap().downcast_ref::<StaticIpError>().is_some());
+        assert!(m.add_credential(account("queued-first")).await.is_err());
+        let saved:Vec<KiroCredentials>=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.len(),2);
+        assert!(saved.iter().all(|c| c.disabled && c.disabled_reason.as_deref()==Some("WaitingStaticIp") && c.proxy_url.is_none()));
+        let reopened=manager(Some(path.clone()),saved);
+        assert_eq!(reopened.static_ip_list().waiting_credential_ids,vec![first,second]);
+        reopened.static_ip_import(vec![input("192.0.2.10")]).unwrap();
+        assert!(!reopened.is_waiting_static_ip(first));
+        assert!(reopened.try_acquire_permit(first).is_some());
+        assert!(reopened.is_waiting_static_ip(second));
+        let bound=reopened.clone_credential(first).unwrap();
+        assert_eq!(bound.proxy_url.as_deref(),Some("http://192.0.2.10:3000"));
+        assert_eq!(bound.proxy_username.as_deref(),Some("vendor-user"));
+        assert_eq!(bound.proxy_password.as_deref(),Some("test-only-password"));
+        reopened.static_ip_import(vec![input("192.0.2.11")]).unwrap();
+        let saved:Vec<KiroCredentials>=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(saved.iter().all(|c| !c.disabled && c.disabled_reason.is_none() && c.proxy_url.is_some()));
+        let restarted=manager(Some(path),saved);
+        assert_eq!(restarted.available_count(),2);
+        assert!(restarted.static_ip_list().waiting_credential_ids.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn concurrent_personal_imports_save_all_and_never_share_ips() {
+        let m=manager(None,vec![]);
+        m.static_ip_import(vec![input("192.0.2.10"),input("192.0.2.11")]).unwrap();
+        m.static_ip_auto_assign(true).unwrap();
+        let mut tasks=tokio::task::JoinSet::new();
+        for i in 0..12 {
+            let m=m.clone();
+            tasks.spawn(async move { m.add_credential(account(&format!("concurrent-{i}"))).await.unwrap() });
+        }
+        while let Some(result)=tasks.join_next().await { result.unwrap(); }
+        let pool=m.static_ip_list();
+        assert_eq!(m.total_count_in_group(None),12);
+        assert_eq!(m.available_count(),2);
+        assert_eq!(pool.waiting_credential_ids.len(),10);
+        assert!(pool.entries.iter().all(|ip| ip.credential_ids.len()==1));
+    }
+
+    #[tokio::test]
+    async fn queued_accounts_take_released_ips_only_after_last_request() {
+        let m=manager(None,vec![]);
+        m.static_ip_import(vec![input("192.0.2.10")]).unwrap();
+        m.static_ip_auto_assign(true).unwrap();
+        let first=m.add_credential(account("owner")).await.unwrap();
+        let second=m.add_credential(account("waiting")).await.unwrap();
+        let lease=m.static_ip_lease(first).unwrap();
+        let permit=m.try_acquire_permit(first).unwrap();
+        m.report_suspended(first);
+        assert!(m.is_waiting_static_ip(second));
+        assert_eq!(m.static_ip_list().entries[0].status,"releasing");
+        drop(lease);
+        m.reconcile_static_ips().unwrap();
+        assert!(m.is_waiting_static_ip(second));
+        drop(permit);
+        m.start_static_ip_maintenance();
+        tokio::time::timeout(StdDuration::from_secs(3),async {
+            while m.is_waiting_static_ip(second) { tokio::time::sleep(StdDuration::from_millis(10)).await; }
+        }).await.unwrap();
+        assert_eq!(m.static_ip_list().entries[0].credential_ids,vec![second]);
+        assert_eq!(m.snapshot().entries.iter().find(|e|e.id==first).unwrap().disabled_reason.as_deref(),Some("Suspended"));
+        let third=m.add_credential(account("waiting-after-delete")).await.unwrap();
+        m.delete_credential(second).unwrap();
+        m.reconcile_static_ips().unwrap();
+        assert_eq!(m.static_ip_list().entries[0].credential_ids,vec![third]);
+    }
+
+    #[tokio::test]
+    async fn paused_ips_and_manually_disabled_waiters_do_not_auto_enable() {
+        let m=manager(None,vec![]);
+        m.static_ip_auto_assign(true).unwrap();
+        m.static_ip_import(vec![input("192.0.2.10")]).unwrap();
+        m.static_ip_enabled(1,false).unwrap();
+        let manual=m.add_credential(account("manual")).await.unwrap();
+        let waiting=m.add_credential(account("waiting")).await.unwrap();
+        m.set_disabled(manual,true).unwrap();
+        m.static_ip_enabled(1,true).unwrap();
+        assert_eq!(m.static_ip_list().entries[0].credential_ids,vec![waiting]);
+        assert_eq!(m.snapshot().entries.iter().find(|e|e.id==manual).unwrap().disabled_reason.as_deref(),Some("Manual"));
+        assert!(m.clone_credential(manual).unwrap().proxy_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn waiting_import_storage_failure_is_atomic_and_whitelist_changes_stay_safe() {
+        let dir=temp_dir();let path=dir.join("credentials.json");
+        let m=manager(Some(path.clone()),vec![]);m.static_ip_auto_assign(true).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(m.add_credential(account("write-failure")).await.is_err());
+        assert_eq!(m.total_count_in_group(None),0);
+        std::fs::remove_dir(&path).unwrap();
+        let id=m.add_credential(account("waiting")).await.unwrap();
+        m.static_ip_config(None,Some(vec!["google".into()])).unwrap();
+        m.static_ip_import(vec![input("192.0.2.10")]).unwrap();
+        assert!(m.is_waiting_static_ip(id));
+        assert!(m.static_ip_lease(id).is_err());
+        m.static_ip_config(None,Some(vec!["github".into(),"google".into()])).unwrap();
+        assert_eq!(m.static_ip_list().entries[0].credential_ids,vec![id]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn initial_metadata_guard_blocks_allocation_until_cache_is_ready() {
+        let m=manager(None,vec![]);m.static_ip_auto_assign(true).unwrap();
+        m.static_ip_import(vec![input("192.0.2.10")]).unwrap();
+        let imported=m.import_credential_with_metadata(account("initializing"),false).await.unwrap();
+        let id=imported.id;
+        assert!(imported.usage.is_some());
+        m.reconcile_static_ips().unwrap();
+        assert!(m.is_waiting_static_ip(id));
+        assert!(m.static_ip_list().entries[0].credential_ids.is_empty());
+        assert!(m.try_acquire_permit(id).is_none());
+        drop(imported);
+        m.reconcile_static_ips().unwrap();
+        assert_eq!(m.static_ip_list().entries[0].credential_ids,vec![id]);
+        assert!(!m.is_waiting_static_ip(id));
+    }
+
+    #[tokio::test]
+    async fn initialization_uses_original_pool_proxy_then_discards_it_for_static_control() {
+        let m=manager(None,vec![]);m.static_ip_auto_assign(true).unwrap();
+        *m.test_import_initializer.lock()=Some(Arc::new(|c,p|Box::pin(async move {
+            assert_eq!(c.proxy_url.as_deref(),Some("http://192.0.2.20:3000"));
+            assert_eq!(p.unwrap().url,"http://192.0.2.20:3000");
+            assert!(!c.static_ip_required);
+            Ok((c,serde_json::from_value(serde_json::json!({"subscriptionInfo":{"subscriptionTitle":"KIRO PRO+"}})).unwrap()))
+        })));
+        let mut c=account("normal-first");c.proxy_url=Some("http://192.0.2.20:3000".into());
+        let id=m.add_credential_with_proxy_origin(c,true).await.unwrap();
+        assert!(m.is_waiting_static_ip(id));assert!(m.clone_credential(id).unwrap().proxy_url.is_none());
+        m.static_ip_import(vec![input("192.0.2.10")]).unwrap();
+        assert_eq!(m.clone_credential(id).unwrap().proxy_url.as_deref(),Some("http://192.0.2.10:3000"));
+    }
+
+    #[test]
+    fn queue_policy_preserves_explicit_proxy_and_nonpersonal_imports() {
+        let m=manager(None,vec![]);
+        assert!(!m.queue_static_ip_import(&mut account("switch-off"),false));
+        m.static_ip_auto_assign(true).unwrap();
+        for url in ["direct","http://192.0.2.20:3000"] {
+            let mut c=account("explicit");c.proxy_url=Some(url.into());
+            assert!(!m.queue_static_ip_import(&mut c,false));
+            assert_eq!(c.proxy_url.as_deref(),Some(url));
+        }
+        let mut fallback=account("pool-fallback");fallback.proxy_url=Some("http://192.0.2.20:3000".into());
+        assert!(m.queue_static_ip_import(&mut fallback,true));
+        assert!(fallback.static_ip_required && fallback.proxy_url.is_none());
+        for provider in ["Enterprise","BuilderId","unknown"] {
+            let mut c=account(provider);c.provider=Some(provider.into());c.auth_method=Some("idc".into());
+            assert!(!m.queue_static_ip_import(&mut c,false));
+        }
+        let mut api=account("api");api.auth_method=Some("api_key".into());api.kiro_api_key=Some("fixture".into());
+        assert!(!m.queue_static_ip_import(&mut api,false));
+        m.static_ip_config(None,Some(vec!["builderid".into()])).unwrap();
+        let mut builder=account("builder");builder.provider=Some("BuilderId".into());builder.auth_method=Some("idc".into());
+        assert!(m.queue_static_ip_import(&mut builder,false));
+    }
 
 }

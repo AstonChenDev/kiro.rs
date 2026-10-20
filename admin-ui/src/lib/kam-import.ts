@@ -1,3 +1,4 @@
+import { importedSubscriptionTitle } from './credential-import'
 // 兼容 KAM 1.8.3 新版平铺格式，统一转换为旧格式（credentials 嵌套结构）
 export function normalizeKamAccount(item: unknown): unknown {
   if (typeof item !== 'object' || item === null) return item
@@ -34,6 +35,7 @@ export function normalizeKamAccount(item: unknown): unknown {
 
     return {
       email,
+      subscriptionTitle: importedSubscriptionTitle(obj),
       userId,
       nickname,
       idp,

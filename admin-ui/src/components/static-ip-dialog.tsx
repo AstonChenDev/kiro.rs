@@ -90,7 +90,7 @@ export function StaticIpDialog({ open, onOpenChange }: { open: boolean; onOpenCh
         <label className="flex items-center justify-between gap-3"><span className="font-medium text-sm">新导入账号自动分配空闲 IP</span>
           <Switch aria-label="新导入账号自动分配空闲 IP" checked={pool.data?.autoAssign ?? false} disabled={editsDisabled}
             onCheckedChange={v => void run(() => setStaticIpAutoAssign(v), v ? '已开启新账号自动分配' : '已关闭自动分配，已有绑定保留')} /></label>
-        <p className="text-xs text-muted-foreground">开启后，允许类型的新账号未指定代理时自动领取一个空闲 IP；没有空闲 IP 则拒绝导入并提示。明确指定普通代理或直连的账号沿用其设置。已有账号不会自动迁移。</p>
+        <p className="text-xs text-muted-foreground">开启后，允许类型的新账号先正常导入并获取订阅和额度，再独占绑定空闲 IP 并启用；没有空闲 IP 时保留完整账号信息，进入“等待静态 IP”禁用状态。新增、启用或释放 IP 后自动绑定并启用。明确指定普通代理或直连的账号沿用其设置。已有账号不会自动迁移。</p>
       </div>
       <div className="rounded-lg border p-3 space-y-2">
         <p className="font-medium text-sm">允许使用静态 IP 的个人账号类型</p>

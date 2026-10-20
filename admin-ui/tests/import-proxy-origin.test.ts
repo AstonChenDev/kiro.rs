@@ -1,3 +1,4 @@
+import { parseCredentialImport, importedSubscriptionTitle, normalizeImportExpiresAt } from '../src/lib/credential-import'
 import { expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { normalizeImportAuthMethod, sha256Hex, extractErrorMessage } from '../src/lib/utils'
@@ -13,11 +14,11 @@ const batchCode = compile(fragment(batch,'  const handleBatchImport =','  const 
 const kamCode = compile(fragment(kam,'function normalizeExpiresAt','export function KamImportDialog')+fragment(kam,'  const handleImport =','  const getStatusIcon ='))
 const ordinary = 'http://127.0.0.9:3000'
 const personal = (provider='Github') => ({refreshToken:'synthetic-proxy-origin-'.repeat(20),authMethod:'social',provider,traffic:{tier:'power',concurrency:15,rpm:10}})
-export async function importRequests(kind:'batch'|'kam', input:unknown, pool=true) {
+export async function importRequests(kind:'batch'|'kam', input:unknown, pool=true, raw=false) {
   const captured:AddCredentialRequest[]=[];const errors:string[]=[]
-  const args={jsonInput:JSON.stringify([input]),skipErrorAccounts:true,
+  const args={jsonInput:JSON.stringify(raw ? input : [input]),skipErrorAccounts:true,
     existingCredentials:{credentials:[]},proxyPool:{proxies:pool?[{enabled:true,url:ordinary}]:[]},
-    normalizeImportAuthMethod,sha256Hex,extractErrorMessage,metadataFieldDefault,metadataFieldValues,normalizeKamAccount,
+    parseCredentialImport,importedSubscriptionTitle,normalizeImportExpiresAt,normalizeImportAuthMethod,sha256Hex,extractErrorMessage,metadataFieldDefault,metadataFieldValues,normalizeKamAccount,
     setImporting:()=>{},setProgress:()=>{},setCurrentProcessing:()=>{},setResults:()=>{},updateResult:()=>{},
     abortRef:{current:null},queryClient:{invalidateQueries:async()=>{}},
     toast:{error:(s:string)=>errors.push(s),success:()=>{},warning:()=>{},info:()=>{}},
@@ -77,5 +78,63 @@ test('KAM keeps explicit providers and external idp compatibility',async()=>{
   const input=flat?{...credentials,idp:'Google'}:{idp:'Google',credentials}
   const {captured,errors}=await importRequests('kam',input,false)
   expect(errors).toEqual([]);expect(captured[0].provider).toBe(provider??'Google')
+ }
+})
+
+test('ordinary batch imports all five nested KAM personal accounts without losing provider', async () => {
+  const accounts = Array.from({length:5}, (_, index) => ({
+    idp:'Github', email:`fixture-${index}@example.invalid`, machineId:`fixture-machine-${index}`,
+    credentials:{refreshToken:`fixture-${index}-`.repeat(30),authMethod:'social',provider:'Github',clientId:'',clientSecret:'',region:'us-east-1'},
+  }))
+  const {captured,errors}=await importRequests('batch',{version:'1.5.0',accounts,groups:[],tags:[]},false,true)
+  expect(errors).toEqual([])
+  expect(captured).toHaveLength(5)
+  captured.forEach((request,index)=>{
+    expect(request).toMatchObject({refreshToken:accounts[index].credentials.refreshToken,
+      authMethod:'social',provider:'Github',email:accounts[index].email,machineId:accounts[index].machineId})
+    expect(request.proxyUrl).toBeUndefined()
+  })
+})
+test('nested KAM input accepts idp fallback in the common batch entry', async () => {
+  const {captured}=await importRequests('batch',{idp:'Google',credentials:{refreshToken:personal().refreshToken,authMethod:'social'}},false)
+  expect(captured[0]).toMatchObject({authMethod:'social',provider:'Google'})
+})
+test('malformed containers fail clearly before sending an import request', () => {
+  for (const input of [null, {accounts:{}}, {accounts:[null]}, {credentials:[]}]) {
+    expect(()=>parseCredentialImport(JSON.stringify(input))).toThrow()
+  }
+  expect(parseCredentialImport('[]')).toEqual([])
+})
+
+for (const kind of ['batch','kam'] as const) test(`${kind} preserves Pro+ and access-token metadata without forcing a traffic override`, async () => {
+  const {captured,errors}=await importRequests(kind,{email:'fixture@example.invalid',idp:'Github',
+    subscription:{title:'KIRO PRO+',type:'Pro_Plus'},credentials:{refreshToken:personal().refreshToken,
+    accessToken:'fixture-access',expiresAt:1793491200000,profileArn:'fixture-profile',authMethod:'social',provider:'Github'}},false)
+  expect(errors).toEqual([])
+  expect(captured[0]).toMatchObject({subscriptionTitle:'KIRO PRO+',accessToken:'fixture-access',profileArn:'fixture-profile',expiresAt:new Date(1793491200000).toISOString()})
+  expect(captured[0].traffic?.tier).toBeUndefined()
+})
+test('flat KAM and exported credentials preserve title, unknown plans stay unknown', async () => {
+  expect(importedSubscriptionTitle({subscription:{type:'Pro_Plus'}})).toBe('KIRO PRO+')
+  expect(importedSubscriptionTitle({subscription:{type:'unrecognized'}})).toBeUndefined()
+  for(const kind of ['batch','kam'] as const){
+    const {captured}=await importRequests(kind,{...personal(),subscriptionTitle:'KIRO PRO+',accessToken:'fixture-access'},false)
+    expect(captured[0].subscriptionTitle).toBe('KIRO PRO+')
+  }
+})
+
+test('five comma-separated Google objects preserve tokens and infer social login', async () => {
+ const accounts=Array.from({length:5},(_,i)=>({email:`google-${i}@example.invalid`,provider:'Google',refreshToken:`fixture-${i}:+/`.repeat(30)}))
+ const pasted=accounts.map(a=>JSON.stringify(a)).join(',\n')
+ const parsed=parseCredentialImport(pasted)
+ expect(parsed).toHaveLength(5)
+ const {captured,errors}=await importRequests('batch',parsed,false,true)
+ expect(errors).toEqual([]);expect(captured).toHaveLength(5)
+ captured.forEach((r,i)=>expect(r).toMatchObject({...accounts[i],authMethod:'social'}))
+})
+test('malformed JSON never echoes credential values and never evaluates text', () => {
+ for (const raw of ['{"refreshToken":"private-fixture",}', '{"refreshToken":"private-fixture"}, malicious()', '[{"refreshToken":"private-fixture"}']) {
+  try {parseCredentialImport(raw);throw Error('unexpected success')}
+  catch(error) {expect(String(error)).not.toContain('private-fixture');expect(String(error)).toContain('JSON')}
  }
 })
