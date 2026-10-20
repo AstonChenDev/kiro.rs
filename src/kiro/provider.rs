@@ -168,7 +168,7 @@ impl KiroProvider {
         let config = token_manager.config();
         let initial_client = build_client_with_timeouts(
             proxy.as_ref(),
-            config.upstream_request_timeout_secs.max(1),
+            config.effective_upstream_total_timeout_secs(),
             tls_backend,
             config.upstream_connect_timeout_secs,
             config.upstream_read_timeout_secs,
@@ -197,7 +197,7 @@ impl KiroProvider {
         let config = self.token_manager.config();
         let client = build_client_with_timeouts(
             effective.as_ref(),
-            config.upstream_request_timeout_secs.max(1),
+            config.effective_upstream_total_timeout_secs(),
             self.tls_backend,
             config.upstream_connect_timeout_secs,
             config.upstream_read_timeout_secs,
@@ -474,6 +474,7 @@ impl KiroProvider {
                 token: &ctx.token,
                 machine_id: &machine_id,
                 config,
+                api_domain: self.token_manager.api_domain(),
             };
 
             let url = endpoint.mcp_url(&rctx);
@@ -857,6 +858,7 @@ impl KiroProvider {
                 token: &ctx.token,
                 machine_id: &machine_id,
                 config,
+                api_domain: self.token_manager.api_domain(),
             };
 
             let url = endpoint.api_url(&rctx);

@@ -48,7 +48,8 @@ Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
 - 自动 token 刷新：支持刷新后回写 `credentials.json`。
 - **多凭据调度**：`priority` 固定优先级和 `balanced` 均衡分配。
 - **故障转移**：凭据失败、额度用尽、账号级 429 限流冷却、token 失效强制刷新。
-- **profileArn 策略**：流式端点按账号类型注入真实 ARN 或 Builder ID 占位 ARN；用量类 / 头部类调用跳过占位 ARN。
+- **profileArn 策略**：流式端点与 MCP（WebSearch）按账号类型注入真实 ARN 或 Builder ID 占位 ARN；用量类调用跳过占位 ARN。
+- **可切换上游域名**：对话 / MCP 可发往 `q.{region}.amazonaws.com`（默认）或新版 Kiro 客户端使用的 `runtime.{region}.kiro.dev`，Admin 面板热切换。
 - **端点抽象**：按凭据选择 `ide` 或 `cli` endpoint。
 - **工具调用**：支持 `tool_use` / `tool_result` 配对、工具名缩短与反向映射。
 - **Thinking / Reasoning 兼容**：支持 `thinking.type=enabled` / `adaptive`、Claude Code 默认 thinking 请求、Kiro 原生 `reasoningContentEvent` 到 Anthropic thinking / signature / redacted thinking 事件的转换。
@@ -322,7 +323,7 @@ codex
 | `/api/admin/stats/*` | 用量统计 |
 | `/api/admin/traces` | 请求链路追踪查询 |
 | `/api/admin/proxy-pool` | 代理池 |
-| `/api/admin/config/*` | 运行时配置 |
+| `/api/admin/config/*` | 运行时配置（含 `GET/PUT /api/admin/config/api-domain` 上游域名） |
 | `/api/admin/auth/*` | Social / IdC 登录流程 |
 | `/api/admin/system/update/*` | 在线更新、回退、版本检查 |
 
@@ -362,6 +363,7 @@ Admin API 鉴权同样支持：
 | `authRegion` | 无 | token 刷新用 Region，未配置时回退 `region` |
 | `apiRegion` | 无 | Kiro API 请求用 Region，未配置时回退 `region` |
 | `defaultEndpoint` | `ide` | 凭据未指定 endpoint 时使用的端点 |
+| `apiDomain` | `amazonaws` | 对话 / MCP 上游域名：`amazonaws` → `q.{region}.amazonaws.com`，`kiro` → `runtime.{region}.kiro.dev`。见[上游域名](#api-domain) |
 | `tlsBackend` | `rustls` | `rustls` 或 `native-tls` |
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
@@ -375,6 +377,10 @@ Admin API 鉴权同样支持：
 | `selfHealMaxConsecutiveRounds` | `5` | 连续自愈且无成功的最大轮数（`0`=不限），超限即停并提示人工介入 |
 | `modelCacheTtlSecs` | `3600` | 每个凭据的上游可用模型缓存 TTL（秒） |
 | `extractThinking` | `true` | 非流式响应是否把旧 `<thinking>` 文本提取成 thinking block |
+| `cacheMeteringCapacity` | `262144` | prompt cache 计量条目上限，钳到 `[1024, 8388608]`；见下方「计量容量选型」 |
+| `cacheMeteringPersistEnabled` | `false` | 是否把计量快照落到 `cache_metering.json`（**0.9.x 起默认关闭**） |
+| `cacheMeteringFlushIntervalSecs` | `300` | 快照落盘间隔（秒），钳到 `[10, 3600]`，仅在落盘开启时有意义 |
+| `cacheMeteringMissDiagnostics` | `true` | 是否开启 miss 归因墓碑表（约 3MB 封顶），关闭后 `missEvicted` 退化为 `missNoEntry` |
 | `traceEnabled` | `true` | 是否写入 `traces.db` |
 | `traceRetentionDays` | `7` | trace 保留天数 |
 | `usageLogRetentionDays` | `31` | `usage_log.*.jsonl` 保留天数 |
@@ -438,6 +444,8 @@ Admin API 鉴权同样支持：
 ```
 
 Enterprise / IdC 账号在流式调用前会按需调用 `ListAvailableProfiles` 解析真实 `profileArn`，成功后写回凭据。纯 Builder ID/free 账号没有 Enterprise profile 时，会回退到官方 IDE 使用的 Builder ID 占位 ARN，以避免流式端点缺少 `profileArn` 返回 400。
+
+上游对这类账号的 `ListAvailableProfiles` 固定返回 403 `AWS Builder ID is not supported for this operation`，该结果按「无 Enterprise profile」处理：不再请求另一区域，并在进程内标记已解析，后续请求不再重复查询（避免每个请求首字前多出两次串行握手）。
 
 #### Social 登录
 
@@ -657,6 +665,8 @@ Kiro 上游可能返回原生 `reasoningContentEvent`。`kiro-rs` 会把它转�
 
 纯 web_search 请求会直接走上游 MCP 搜索接口。混合工具场景下，如果上游返回只包含 `web_search` 的工具调用，`kiro-rs` 会内部调用同一套 MCP 搜索接口，把结果作为 tool_result 喂回上游，直到上游停止搜索或达到轮数限制；其它工具调用会原样返回给客户端。
 
+MCP 搜索请求通过 `x-amzn-kiro-profile-arn` 头携带 profileArn，取值规则与对话请求相同（真实 ARN，或 Builder ID / Social 占位 ARN；API Key 凭据不发送）。上游 `/mcp` 缺少该头会返回 400 `profileArn is required for this request.`，表现为客户端收到 502 `Upstream API request failed.`。
+
 <a id="images"></a>
 ## 图片处理
 
@@ -702,7 +712,7 @@ data/
 - `kiro_stats.json`：凭据成功 / 失败 / 额度 / 冷却等统计。
 - `kiro_balance_cache.json`：凭据订阅、额度、邮箱等缓存。
 - `proxy_pool.json`：代理池与健康状态。
-- `cache_metering.json`：prompt cache 计量缓存，定期落盘。
+- `cache_metering.json`：prompt cache 计量快照，**默认不再读写**（需显式 `cacheMeteringPersistEnabled: true`）。
 - `traces.db`：SQLite 请求链路追踪数据库，WAL 模式。
 - `usage_log.*.jsonl`：按日滚动请求用量日志。
 
@@ -712,6 +722,78 @@ data/
 - `cache_creation_input_tokens`
 - `cache_read_input_tokens`
 - `output_tokens`
+
+### Prompt cache 计量容量选型
+
+`CacheMeter` 是一张定容表。写入速率为 `W` 条/秒时，一条 entry 的实际存活期是
+
+```text
+T_eff = min(C / W, TTL)
+```
+
+`C < W × TTL` 时 TTL 完全失效，命中率由容量而不是 TTL 决定，表现为 `cache_read`
+随负载**无声衰减**。上游每请求最多写 4 条断点、默认 TTL 300 秒，所以容量应满足：
+
+```text
+C >= peak_req_per_sec × entries_per_req × TTL_secs
+```
+
+默认 `262144` 支撑约 `262144 / (4 × 300) ≈ 218 req/s`，内存约 16–24MB
+（单条按 64 字节估算）。上界 `8388608` 约 512MB —— 那是「再大就该上 Redis
+共享层而不是堆内存」的界线，不是推荐值。改过切段策略、`entries_per_req`
+远大于 4 的部署，按公式自行调高。
+
+容量、落盘开关、落盘间隔、miss 诊断开关**启动时固定，运行时不可改**：
+改容量会立即触发一次大规模淘汰，不适合做热调旋钮。改这些 = 改 `config.json`
+（或环境变量）+ 重启。Admin API `GET /api/admin/cache-metering` 只读暴露当前生效值。
+
+环境变量（优先级：`config.json` 显式值 > 环境变量 > 内置默认）：
+
+| 环境变量 | 对应字段 | 默认 |
+|---|---|---:|
+| `KIRO_RS_CACHE_CAPACITY` | `cacheMeteringCapacity` | `262144` |
+| `KIRO_RS_CACHE_PERSIST` | `cacheMeteringPersistEnabled` | `false` |
+| `KIRO_RS_CACHE_FLUSH_INTERVAL_SECS` | `cacheMeteringFlushIntervalSecs` | `300` |
+| `KIRO_RS_CACHE_MISS_DIAGNOSTICS` | `cacheMeteringMissDiagnostics` | `true` |
+
+数值解析失败、为 `0` 或为空串都视为「未表态」并打一条 warn，回落到下一优先级，不会中止启动。
+
+#### 怎么判断该不该调容量
+
+后台任务每 60 秒输出一行（本周期无任何增量时不输出）：
+
+```text
+cache_meter stats entries_len=13421 capacity=262144 hits=90120 misses=10233 evicted=0 expired=240311
+  miss_no_entry=8120 miss_expired=1900 miss_evicted=13 miss_no_breakpoint=180 miss_no_seed=20 tombstone_clears=0
+```
+
+- `miss_evicted` 持续非零 + `entries_len` 贴着 `capacity` → **容量不够**，按上面的公式调高。
+- `miss_expired` 占多数、`evicted=0` → 是真实 TTL 过期，调容量没用。
+- `miss_no_breakpoint` / `miss_no_seed` 占多数 → 客户端没声明 `cache_control`，
+  或请求缺少 `metadata.user_id` 且用的是 `id=0` 系统 Key，与容量无关。
+
+单条 miss 的归因还会在 `RUST_LOG=debug` 下输出：有断点的请求按断点逐条打
+`cache_meter miss block_idx=.. reason=Absent|Expired|Evicted`（一个断点最多一条，
+单请求最多 4 条）；整条请求级的两种原因打 `cache_meter miss reason=no_breakpoint`
+与 `cache_meter miss reason=no_seed`。五种原因都可在 debug 日志里看到。
+
+> 计数口径：**一个断点只记一次账**。lookback 会向后探最多 20 个 hash，
+> 「深层没有、浅层命中」是正常的部分前缀命中，只记 1 次 `hits`，不会同时产生
+> 一堆 `misses` —— 否则命中率报表会被探测次数稀释。
+
+#### 升级提示：快照默认不再落盘
+
+`cacheMeteringPersistEnabled` 默认为 `false`，即**默认不再读写 `cache_metering.json`**。
+依据：计量 TTL 只有 300 秒，快照只在重启后 5 分钟内有价值，而容量调大后单次全量
+JSON 重写的代价线性放大。关闭时启动不读该文件、运行与退出都不写该文件，
+也**不会删除**已有文件（留给回滚）。需要原行为显式写：
+
+```json
+{ "cacheMeteringPersistEnabled": true }
+```
+
+快照格式仍是 JSON（未换二进制）：默认关闭后这条路径不再是热点，换格式要带
+迁移与兼容分支，收益不抵复杂度。旧版本写的快照文件可直接被新版本加载。
 
 <a id="admin-ui"></a>
 ## 🖥️ Admin UI
@@ -753,6 +835,18 @@ credential.apiRegion -> credential.region -> config.apiRegion -> config.region
 仅配置凭据 `region` 时，Token 刷新和 API 请求都默认使用该区域。需要分开设置时，使用凭据级 `authRegion` 和 `apiRegion`；`authRegion` 本身不作为 API 请求区域的回退值。
 
 部分 REST / 管理类上游接口只在 `us-east-1` 和 `eu-central-1` 提供服务，代码会按账号区域选择候选端点并在必要时回退。
+
+<a id="api-domain"></a>
+### 上游域名
+
+`apiDomain` 决定对话（`generateAssistantResponse`）和 MCP（WebSearch）请求的 host：
+
+| 值 | host | 说明 |
+|---|---|---|
+| `amazonaws`（默认） | `q.{apiRegion}.amazonaws.com` | 原有行为 |
+| `kiro` | `runtime.{apiRegion}.kiro.dev` | 新版 Kiro IDE / Kiro CLI 使用的域名；官方客户端只内置 `us-east-1`、`eu-central-1` 等少数区域 |
+
+Token 刷新、用量查询、`ListAvailableProfiles` 等 REST 接口不受影响。可在 Admin 面板「调度设置 → 上游域名」切换，或调用 `PUT /api/admin/config/api-domain`（Body：`{"domain":"kiro"}`），立即生效并写回 `config.json`，无需重启。
 
 ### 代理优先级
 
@@ -891,14 +985,14 @@ git diff --check
 
 ## 本地二次开发范围（2026-10-12）
 
-本地以生产 `codex/aston-dev` 的 `1ef319fa4f62fb00d222779d35826cf374753cc2` 为基线。原项目功能及原有问题保持该版本行为；后续仅维护以下二次开发功能及它们所必需的接入代码。
+二开最初以 `1ef319fa4f62fb00d222779d35826cf374753cc2` 为基线，随后按要求回退至 `c8e897d` 并继续开发。2026-10-20 在已验证的 `858ac89` 上合入上游 `v0.9.2`，保留下列二开功能与配置兼容性；未恢复此前回退的故障转移及冷却改动。
 
 - 凭据管理支持 Enterprise、GitHub、Google、Builder ID、IAM SSO、Entra ID、API Key 及未识别登录类型，分别设置默认限制和 FREE、PRO、PRO+、MAX、POWER、STUDENT、待识别订阅等级的并发／RPM。每项限制作用于单个账号；优先级为：单账号设置 → 登录类型＋订阅等级 → 登录类型默认 → 通用订阅等级 → 全局默认。并发和 RPM 分别继承，清空单项恢复继承，0 表示不限；新账号自动采用对应策略。旧配置未设置登录类型策略时保持原有限制。
 - 类型策略和单账号设置均在凭据管理页面；类型策略面板默认折叠，可切换登录类型编辑，保存时仅更新改动的字段。显示账号的登录类型、订阅等级、限制来源、实时并发及最近 60 秒请求数。
 - 每次进入凭据管理页面自动刷新额度；确认额度已耗尽时自动禁用，可手动关闭该功能。读取失败或额度未知不视为耗尽。
 - 支持删除全部选中的凭据（含跨分页选择），显示进度和失败原因，失败项保留选中。
 - 兼容平铺／嵌套凭据导入，导入导出保留单账号流量策略。
-- 上游总请求超时默认 3600 秒，可通过 `upstreamRequestTimeoutSecs` 调整；连接超时默认 15 秒、连续读取无数据超时默认 120 秒，三者独立生效，因此 3600 秒不保证所有上游响应都会持续到该时间。
+- 上游总请求超时默认 3600 秒，兼容原 `upstreamRequestTimeoutSecs`。上游新增的 `upstreamTotalTimeoutSecs` 仅在显式设置时优先，设为 0 可关闭总时限；不设置时保留原值，不回退到上游默认的 720 秒。连接超时默认 15 秒、连续读取无数据超时默认 120 秒，三者独立生效。
 - 所有 `claude-opus-*` 模型转发输出预算 `max_tokens`，与是否开启思考无关。Opus 4.6 保留最小 1024、超过 64000 按 64000 处理的规则；其他 Opus 模型按请求原值转发（如 Opus 5.5 的 128000），实际可接受上限与生成长度由上游决定。非 Opus 模型保持原有支持范围，保留输出结束原因识别。
 - 明确的账号凭据认证失败返回 403 和受控原因文案；普通参数错误仍为 400，本站访问 Key 校验沿用原行为。已经开始输出的 SSE 流不能再改变 HTTP 状态。
 

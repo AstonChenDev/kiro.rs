@@ -68,16 +68,60 @@ impl TokenUsage {
     }
 }
 
+/// 上游内容过滤拦截时 `metadataEvent.stopReason` 的取值。
+pub const CONTENT_FILTERED_STOP_REASON: &str = "CONTENT_FILTERED";
+
+/// `metadataEvent.stopDetails.refusal`：上游拒答的分类与说明。
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Refusal {
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub explanation: Option<String>,
+}
+
+/// `metadataEvent.stopDetails`。
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StopDetails {
+    #[serde(default)]
+    pub refusal: Option<Refusal>,
+}
+
 /// `metadataEvent` payload。
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetadataEvent {
-    /// Preserve the upstream termination reason for stream diagnostics.
-    #[serde(default)]
-    pub stop_reason: Option<String>,
     /// 有些 metadataEvent 只携带 stopReason，因此 tokenUsage 必须保持可选。
     #[serde(default)]
     pub token_usage: Option<TokenUsage>,
+    /// 上游停止原因，如 `CONTENT_FILTERED`。
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+    #[serde(default)]
+    pub stop_details: Option<StopDetails>,
+}
+
+impl MetadataEvent {
+    /// 上游内容过滤拦截时返回可读的拒答说明（`category: explanation`），否则 `None`。
+    ///
+    /// 拦截后上游只下发 reasoning、不下发正文和 meteringEvent；不识别这一信号会把
+    /// 拒答伪装成「成功的空响应」，客户端只能盲目重试同一段被拦截的历史。
+    pub fn content_filter_refusal(&self) -> Option<String> {
+        if self.stop_reason.as_deref() != Some(CONTENT_FILTERED_STOP_REASON) {
+            return None;
+        }
+        let refusal = self.stop_details.as_ref().and_then(|d| d.refusal.as_ref());
+        let category = refusal.and_then(|r| r.category.as_deref());
+        let explanation = refusal.and_then(|r| r.explanation.as_deref());
+        Some(match (category, explanation) {
+            (Some(c), Some(e)) => format!("{c}: {e}"),
+            (Some(c), None) => c.to_string(),
+            (None, Some(e)) => e.to_string(),
+            (None, None) => CONTENT_FILTERED_STOP_REASON.to_string(),
+        })
+    }
 }
 
 impl MetadataEvent {
@@ -112,7 +156,7 @@ mod tests {
             ("TOOL_USE", None),
             ("unknown", None),
         ] {
-            let event = MetadataEvent { stop_reason: Some(raw.into()), token_usage: None };
+            let event = MetadataEvent { stop_reason: Some(raw.into()), ..Default::default() };
             assert_eq!(event.stop_reason_override(), expected);
         }
     }
@@ -145,6 +189,19 @@ mod tests {
     fn metadata_without_token_usage_is_not_treated_as_zero_truth() {
         let event: MetadataEvent = serde_json::from_str(r#"{"stopReason":"end_turn"}"#).unwrap();
         assert!(event.token_usage.is_none());
+        assert_eq!(event.content_filter_refusal(), None);
+    }
+
+    #[test]
+    fn content_filtered_stop_reason_is_a_refusal_with_upstream_explanation() {
+        let event: MetadataEvent = serde_json::from_str(
+            r#"{"stopReason":"CONTENT_FILTERED","stopDetails":{"refusal":{"category":"CYBER","explanation":"cannot continue"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            event.content_filter_refusal().as_deref(),
+            Some("CYBER: cannot continue")
+        );
     }
 
     #[test]
