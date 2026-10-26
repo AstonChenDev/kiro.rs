@@ -29,7 +29,7 @@ pub struct Inventory {
 }
 impl Default for Inventory {
     fn default() -> Self {
-        Self { auto_assign: false, allowed_providers: vec!["github".into(), "google".into()], next_id: 0, entries: vec![] }
+        Self { auto_assign: false, allowed_providers: vec!["github".into(), "google".into(), "builderid".into()], next_id: 0, entries: vec![] }
     }
 }
 /// Only explicitly identified personal identities are eligible. Corporate methods win
@@ -879,7 +879,7 @@ mod tests {
             ("idc", Some("Enterprise"), None, false),
             ("external_idp", Some("Github"), None, false),
             ("api_key", Some("Github"), Some("ksk-fixture"), false),
-            ("idc", Some("BuilderID"), None, false),
+            ("idc", Some("BuilderID"), None, true),
         ] {
             let mut c = account("test"); c.auth_method = Some(method.into()); c.provider = provider.map(str::to_owned);
             c.kiro_api_key = key.map(str::to_owned); c.proxy_url = Some("http://127.0.0.9:3000".into());
@@ -1070,7 +1070,7 @@ mod tests {
 #[test]
 fn provider_policy_defaults_and_enterprise_cannot_bypass() {
     let m=manager(None,vec![]); m.static_ip_import(vec![input("192.0.2.10")]).unwrap(); m.static_ip_auto_assign(true).unwrap();
-    assert_eq!(m.static_ip_list().allowed_providers,vec!["github","google"]);
+    assert_eq!(m.static_ip_list().allowed_providers,vec!["github","google","builderid"]);
     for (method, provider) in [("idc","Enterprise"),("idc","iam_sso"),("external_idp","Google"),("social","Enterprise"),("social",""),("api_key","Github")] {
         let mut c=account("x"); c.auth_method=Some(method.into()); c.provider=Some(provider.into());
         assert!(m.prepare_static_ip(&mut c).unwrap().is_none()); assert!(c.proxy_url.is_none());
@@ -1256,6 +1256,7 @@ fn import_rejects_incompatible_types_atomically_but_adopts_one_idle_personal_acc
     for (method,provider) in [("idc","Enterprise"),("social","Unknown"),("idc","BuilderID")] {
         let mut c=account("legacy");c.id=Some(1);c.auth_method=Some(method.into());c.provider=Some(provider.into());c.proxy_url=Some("http://192.0.2.10:4000".into());
         let m=manager(None,vec![c]);
+        m.static_ip_config(None,Some(vec!["github".into(),"google".into()])).unwrap();
         assert!(m.static_ip_import(vec![input("192.0.2.11"),input("192.0.2.10")]).is_err());
         assert!(m.static_ip_list().entries.is_empty());
         assert_eq!(m.clone_credential(1).unwrap().proxy_url.as_deref(),Some("http://192.0.2.10:4000"));
@@ -1963,6 +1964,53 @@ async fn hostname_proxy_cannot_use_managed_ip_and_pins_all_addresses() {
         assert_eq!(m.clone_credential(id).unwrap().proxy_url.as_deref(),Some("http://192.0.2.10:3000"));
     }
 
+    #[tokio::test(flavor="multi_thread",worker_threads=2)]
+    async fn builder_id_default_policy_initializes_binds_and_refills_waiting_accounts() {
+        let dir=temp_dir(); let path=dir.join("credentials.json");
+        let m=manager(Some(path.clone()),vec![]);
+        m.static_ip_auto_assign(true).unwrap();
+        m.static_ip_import(vec![input("192.0.2.10")]).unwrap();
+        let initialized=Arc::new(AtomicU32::new(0));
+        let count=initialized.clone();
+        *m.test_import_initializer.lock()=Some(Arc::new(move |mut c, proxy| {
+            let count=count.clone();
+            Box::pin(async move {
+                assert!(proxy.is_none());
+                assert!(!c.static_ip_required && c.proxy_url.is_none());
+                count.fetch_add(1,Ordering::SeqCst);
+                c.access_token=Some("initialized-builder-access".into());
+                Ok((c,serde_json::from_value(serde_json::json!({
+                    "subscriptionInfo":{"subscriptionTitle":"KIRO PRO+"},
+                    "usageBreakdownList":[{"usageLimitWithPrecision":2000,"currentUsage":3}]
+                })).unwrap()))
+            })
+        }));
+        let builder=|name| {
+            let mut c=account(name); c.auth_method=Some("idc".into()); c.provider=Some("BuilderId".into());
+            c.client_id=Some("fixture-client".into()); c.client_secret=Some("fixture-secret".into()); c
+        };
+        let first=m.add_credential(builder("builder-first")).await.unwrap();
+        let second=m.add_credential(builder("builder-second")).await.unwrap();
+        assert_eq!(initialized.load(Ordering::SeqCst),2);
+        assert_eq!(m.static_ip_list().entries[0].credential_ids,vec![first]);
+        assert!(m.is_waiting_static_ip(second));
+        assert!(m.try_acquire_permit(second).is_none());
+        assert!(m.static_ip_lease(second).is_err());
+        let saved:Vec<KiroCredentials>=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(saved.iter().all(|c| c.access_token.as_deref()==Some("initialized-builder-access") && c.subscription_title.as_deref()==Some("KIRO PRO+")));
+        let reopened=manager(Some(path),saved);
+        assert!(reopened.is_waiting_static_ip(second));
+        reopened.set_disabled(first,true).unwrap();
+        assert_eq!(reopened.static_ip_list().entries[0].credential_ids,vec![second]);
+        assert!(!reopened.is_waiting_static_ip(second));
+        assert!(reopened.try_acquire_permit(second).is_some());
+        assert!(reopened.clone_credential(first).unwrap().disabled);
+        reopened.static_ip_import(vec![input("192.0.2.11")]).unwrap();
+        assert!(reopened.clone_credential(first).unwrap().disabled);
+        assert_eq!(reopened.static_ip_list().entries[1].status,"free");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn queue_policy_preserves_explicit_proxy_and_nonpersonal_imports() {
         let m=manager(None,vec![]);
@@ -1976,15 +2024,17 @@ async fn hostname_proxy_cannot_use_managed_ip_and_pins_all_addresses() {
         let mut fallback=account("pool-fallback");fallback.proxy_url=Some("http://192.0.2.20:3000".into());
         assert!(m.queue_static_ip_import(&mut fallback,true));
         assert!(fallback.static_ip_required && fallback.proxy_url.is_none());
-        for provider in ["Enterprise","BuilderId","unknown"] {
+        for provider in ["Enterprise","unknown"] {
             let mut c=account(provider);c.provider=Some(provider.into());c.auth_method=Some("idc".into());
             assert!(!m.queue_static_ip_import(&mut c,false));
         }
         let mut api=account("api");api.auth_method=Some("api_key".into());api.kiro_api_key=Some("fixture".into());
         assert!(!m.queue_static_ip_import(&mut api,false));
-        m.static_ip_config(None,Some(vec!["builderid".into()])).unwrap();
         let mut builder=account("builder");builder.provider=Some("BuilderId".into());builder.auth_method=Some("idc".into());
         assert!(m.queue_static_ip_import(&mut builder,false));
+        m.static_ip_config(None,Some(vec!["github".into(),"google".into()])).unwrap();
+        let mut excluded=account("excluded-builder");excluded.provider=Some("BuilderId".into());excluded.auth_method=Some("idc".into());
+        assert!(!m.queue_static_ip_import(&mut excluded,false));
     }
 
 }

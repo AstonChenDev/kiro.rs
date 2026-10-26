@@ -117,7 +117,7 @@ export function StaticIpDialog({ open, onOpenChange }: { open: boolean; onOpenCh
         <div className="flex flex-wrap gap-4">{[['github', 'GitHub'], ['google', 'Google'], ['builderid', 'Builder ID']].map(([value, title]) =>
           <label key={value} className="flex items-center gap-2 text-sm"><Switch aria-label={`${title} 使用静态 IP`} checked={pool.data?.allowedProviders.includes(value) ?? false} disabled={editsDisabled}
             onCheckedChange={enabled => void changeProvider(value, enabled)} />{title}</label>)}</div>
-        <p className="text-xs text-muted-foreground">默认允许 GitHub、Google。Enterprise、IAM SSO、Entra ID、API Key 和未知类型不分配。关闭某类型会释放该类型已有的静态 IP，账号恢复全局代理或直连；若仍有请求，需等请求结束后再关闭。</p>
+        <p className="text-xs text-muted-foreground">默认允许 GitHub、Google、Builder ID 个人账号。Enterprise、IAM SSO、Entra ID、API Key 和未知类型不分配。关闭某类型会释放该类型已有的静态 IP，账号恢复全局代理或直连；若仍有请求，需等请求结束后再关闭。</p>
         <p className="text-xs text-muted-foreground">异常账号恢复后会重新领取空闲 IP；没有空闲 IP 时暂停调用，不会借用其他账号的地址。关闭自动分配不会取消这项恢复保护。</p>
         {!!pool.data?.waitingCredentialIds.length && <p className="text-sm text-amber-600">等待空闲 IP 的账号：{pool.data.waitingCredentialIds.map(id => `#${id}`).join('、')}</p>}
       </div>
