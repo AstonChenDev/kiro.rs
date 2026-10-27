@@ -3,7 +3,7 @@
 //! 负责 Token 过期检测和刷新，支持 Social 和 IdC 认证方式
 //! 支持多凭据 (MultiTokenManager) 管理
 
-use crate::kiro::error::UpstreamCredentialError;
+use crate::kiro::error::{CredentialRefreshCooldownError, UpstreamCredentialError};
 use crate::kiro::model::credentials::InvalidCredentialConfig;
 #[derive(Debug, thiserror::Error)]
 #[error("流量策略保存失败: {0}")]
@@ -1048,6 +1048,10 @@ struct CredentialEntry {
     /// `Some(t)` 且 `t > now()` 时视为不可用；`t <= now()` 时自动恢复。
     /// 不持久化，进程重启后清空。
     throttled_until: Option<Instant>,
+    /// Transient transport/refresh failures use a separate, runtime-only backoff. Never disable
+    /// the credential or release its exclusive IP just because the network failed.
+    refresh_retry_at: Option<Instant>,
+    transient_failure_count: u32,
     /// RPM 主动限流的滑动窗口：最近 60 秒内被选中发起请求的时间戳队列。
     /// 队列长度达到 `account_rpm_limit` 时该凭据本窗口内被排除出候选。
     /// 不持久化，进程重启后清空；不限流时仍统计实时 RPM。
@@ -1069,6 +1073,13 @@ struct CredentialEntry {
 }
 
 impl CredentialEntry {
+    fn refresh_retry_remaining(&self, now: Instant) -> Option<u64> {
+        self.refresh_retry_at
+            .and_then(|until| until.checked_duration_since(now))
+            .filter(|remaining| !remaining.is_zero())
+            .map(|remaining| remaining.as_secs().saturating_add(u64::from(remaining.subsec_nanos() > 0)))
+    }
+
     /// Token refresh operates on a pre-network snapshot. Keep policy edits and
     /// subscription discovery that completed while that refresh was in flight.
     fn replace_refreshed_credentials(&mut self, source: &KiroCredentials, mut credentials: KiroCredentials) {
@@ -1087,6 +1098,9 @@ impl CredentialEntry {
         }
         self.balance_auth_fingerprint = MultiTokenManager::traffic_auth_fingerprint(&credentials);
         self.credentials = credentials;
+        self.refresh_failure_count = 0;
+        self.refresh_retry_at = None;
+        self.transient_failure_count = 0;
     }
 
     fn traffic_balance_identity(&mut self) -> String {
@@ -1106,6 +1120,8 @@ impl CredentialEntry {
         self.disabled = false;
         self.disabled_reason = None;
         self.throttled_until = None;
+        self.refresh_retry_at = None;
+        self.transient_failure_count = 0;
         self.clear_self_heal_streak();
     }
 }
@@ -1261,6 +1277,8 @@ pub struct CredentialEntrySnapshot {
     /// 临时冷却剩余秒数（账号级 429 风控）；冷却中且 `> 0` 才返回
     #[serde(skip_serializing_if = "Option::is_none")]
     pub throttled_remaining_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_retry_remaining_secs: Option<u64>,
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
@@ -1557,6 +1575,8 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     throttled_until: None,
+                    refresh_retry_at: None,
+                    transient_failure_count: 0,
                     rpm_window: VecDeque::new(),
                     active_requests: Arc::new(AtomicU32::new(0)),
                     proxy_operations: Arc::new(AtomicU32::new(0)),
@@ -1923,6 +1943,7 @@ impl MultiTokenManager {
             .iter()
             .filter(|entry| {
                 !entry.disabled
+                    && entry.refresh_retry_remaining(now).is_none()
                     && !entry
                         .throttled_until
                         .map(|until| until > now)
@@ -2029,7 +2050,7 @@ impl MultiTokenManager {
         self.entries
             .lock()
             .iter()
-            .filter(|e| !e.disabled && !(e.credentials.static_ip_required && e.credentials.proxy_url.is_none()) && !e.throttled_until.map(|t| t > now).unwrap_or(false))
+            .filter(|e| !e.disabled && e.refresh_retry_remaining(now).is_none() && !(e.credentials.static_ip_required && e.credentials.proxy_url.is_none()) && !e.throttled_until.map(|t| t > now).unwrap_or(false))
             .count()
     }
 
@@ -2041,6 +2062,7 @@ impl MultiTokenManager {
         now: Instant,
     ) -> bool {
         !entry.disabled
+            && entry.refresh_retry_remaining(now).is_none()
             && !(entry.credentials.static_ip_required && entry.credentials.proxy_url.is_none())
             && !entry
                 .throttled_until
@@ -2087,6 +2109,7 @@ impl MultiTokenManager {
 
         for entry in entries.iter().filter(|entry| {
             !entry.disabled
+                && entry.refresh_retry_remaining(now).is_none()
                 && !(entry.credentials.static_ip_required && entry.credentials.proxy_url.is_none())
                 && static_ips::check_static_binding(store, entries, entry).is_ok()
                 && !entry
@@ -2154,7 +2177,7 @@ impl MultiTokenManager {
         let entry = entries.iter().find(|e| e.id == id)?;
         static_ips::check_static_binding(&store, &entries, entry).ok()?;
         let entry = entries.iter_mut().find(|e| e.id == id)?;
-        if (entry.credentials.static_ip_required && entry.credentials.proxy_url.is_none()) || entry.disabled || entry.throttled_until.is_some_and(|t| t > now)
+        if (entry.credentials.static_ip_required && entry.credentials.proxy_url.is_none()) || entry.disabled || entry.refresh_retry_remaining(now).is_some() || entry.throttled_until.is_some_and(|t| t > now)
             || self.concurrency_exceeded(entry) || self.rpm_exceeded(entry, now) { return None; }
         while entry.rpm_window.front().is_some_and(|t| now.duration_since(*t).as_secs() >= RPM_WINDOW_SECS) {
             entry.rpm_window.pop_front();
@@ -2624,6 +2647,9 @@ impl MultiTokenManager {
                         return Err(error);
                     }
                     if let Some(error) = last_static_error { return Err(error); }
+                    if let Some(error) = self.refresh_cooldown_for_request(&entries, model, group) {
+                        return Err(error.into());
+                    }
                     if let Some(error) = last_credential_error { return Err(error); }
                     // Subsequent calls must retain a known permanent rejection,
                     // while mixed manual/temporary failures keep their old behavior.
@@ -2669,6 +2695,7 @@ impl MultiTokenManager {
                     } else { None };
                     attempt_count += 1;
                     if !has_available {
+                        self.check_refresh_cooldown(id)?;
                         if let Some(error) = last_credential_error { return Err(error); }
                         anyhow::bail!("所有凭据均已禁用（0/{}）", total);
                     }
@@ -2716,6 +2743,9 @@ impl MultiTokenManager {
         // A local binding conflict is not a token failure: do not disable an
         // otherwise healthy account or release its IP to resolve the conflict.
         if let Some(error) = error.downcast_ref::<static_ips::StaticIpError>() { return Err(static_ips::StaticIpError(error.0.clone()).into()); }
+        if error.downcast_ref::<CredentialRefreshCooldownError>().is_some() {
+            return Ok(Some(self.available_count() > 0));
+        }
         if let Some(error) = error.downcast_ref::<UpstreamRateLimitError>() {
             tracing::warn!("凭据 #{} Token 刷新被上游限流", id);
             return Err(error.clone().into());
@@ -2771,6 +2801,7 @@ impl MultiTokenManager {
         id: u64,
         _credentials: &KiroCredentials,
     ) -> anyhow::Result<CallContext> {
+        self.check_refresh_cooldown(id)?;
         let static_ip_lease = self.static_ip_lease(id)?;
         let fresh = self.clone_credential(id).ok_or_else(|| anyhow::anyhow!("凭据不存在: {id}"))?;
         let credentials = &fresh;
@@ -2794,6 +2825,7 @@ impl MultiTokenManager {
         let creds = if needs_refresh {
             // 获取刷新锁，确保同一时间只有一个刷新操作
             let _guard = self.refresh_lock.lock().await;
+            self.check_refresh_cooldown(id)?;
 
             // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
             let current_creds = {
@@ -2809,10 +2841,8 @@ impl MultiTokenManager {
                 // 确实需要刷新
                 let global_proxy = self.proxy.lock().clone();
                 let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
-                let _proxy_use = self.prepare_proxy_use(&current_creds, effective_proxy.as_ref()).await?;
-                let effective_proxy = _proxy_use.proxy().cloned();
                 let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                    self.refresh_managed_token(id, &current_creds, effective_proxy.as_ref()).await?;
 
                 if is_token_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
@@ -3156,7 +3186,10 @@ impl MultiTokenManager {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.failure_count = 0;
-                entry.refresh_failure_count = 0;
+                if entry.refresh_retry_remaining(Instant::now()).is_none() {
+                    entry.refresh_failure_count = 0;
+                    entry.transient_failure_count = 0;
+                }
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 // 成功 = 风控已解除，提前结束冷却
@@ -3520,75 +3553,82 @@ impl MultiTokenManager {
         result
     }
 
-    /// 报告指定凭据刷新 Token 失败。
-    ///
-    /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
-    /// 与 API 401/403 的累计失败策略保持一致。
+    /// Transient token-refresh failures back off without changing disabled state.
+    /// Retain the exclusive proxy so a temporary outage cannot move an account's IP.
     pub fn report_refresh_failure(&self, id: u64) -> bool {
-        let _static_reconcile = static_ips::ReconcileOnDrop(self);
-        let (result, newly_disabled) = {
-            let mut entries = self.entries.lock();
-            let mut current_id = self.current_id.lock();
+        self.report_transient_failure(id, true)
+    }
 
-            let entry = match entries.iter_mut().find(|e| e.id == id) {
-                Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled),
-            };
+    /// Dedicated proxy transport errors must not count as authentication failures.
+    pub fn report_network_failure(&self, id: u64) -> bool {
+        self.report_transient_failure(id, false)
+    }
 
-            if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
-            }
-
-            entry.last_used_at = Some(Utc::now().to_rfc3339());
-            entry.refresh_failure_count += 1;
-            let refresh_failure_count = entry.refresh_failure_count;
-
-            tracing::warn!(
-                "凭据 #{} Token 刷新失败（{}/{}）",
-                id,
-                refresh_failure_count,
-                MAX_FAILURES_PER_CREDENTIAL
-            );
-
-            if refresh_failure_count < MAX_FAILURES_PER_CREDENTIAL {
-                (entries.iter().any(|e| !e.disabled), false)
-            } else {
-                entry.disabled = true;
-                entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
-                entry.clear_self_heal_streak();
-
-                tracing::error!(
-                    "凭据 #{} Token 已连续刷新失败 {} 次，已被禁用",
-                    id,
-                    refresh_failure_count
-                );
-
-                let has_available = if let Some(next) = entries
-                    .iter()
-                    .filter(|e| !e.disabled)
-                    .min_by_key(|e| (e.credentials.priority, e.id))
-                {
-                    *current_id = next.id;
-                    tracing::info!(
-                        "已切换到凭据 #{}（优先级 {}）",
-                        next.id,
-                        next.credentials.priority
-                    );
-                    true
-                } else {
-                    tracing::error!("所有凭据均已禁用！");
-                    false
-                };
-                (has_available, true)
-            }
-        };
-        if newly_disabled {
-            if let Err(error) = self.persist_credentials() {
-                tracing::warn!("凭据 #{} Token 刷新禁用状态持久化失败: {}", id, error);
+    fn report_transient_failure(&self, id: u64, refreshing: bool) -> bool {
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+            if !entry.disabled && entry.refresh_retry_remaining(now).is_none() {
+                if refreshing {
+                    entry.refresh_failure_count = entry.refresh_failure_count.saturating_add(1);
+                }
+                entry.transient_failure_count = entry.transient_failure_count.saturating_add(1);
+                let shift = entry.transient_failure_count.saturating_sub(1).min(4);
+                let seconds = (30u64 << shift).min(300);
+                entry.refresh_retry_at = Some(now + StdDuration::from_secs(seconds));
+                entry.last_used_at = Some(Utc::now().to_rfc3339());
+                tracing::warn!(credential_id = id, retry_after_secs = seconds,
+                    consecutive_failures = entry.refresh_failure_count,
+                    "网络或 Token 刷新暂时失败，账号进入冷却，保留启用状态和静态 IP");
             }
         }
-        self.save_stats_debounced();
-        result
+        entries.iter().any(|entry| self.entry_available_for_request(entry, None, None, now))
+    }
+
+    fn check_refresh_cooldown(&self, id: u64) -> anyhow::Result<()> {
+        let entries = self.entries.lock();
+        if let Some(seconds) = entries.iter().find(|entry| entry.id == id)
+            .and_then(|entry| entry.refresh_retry_remaining(Instant::now())) {
+            return Err(CredentialRefreshCooldownError { retry_after_secs: seconds }.into());
+        }
+        Ok(())
+    }
+
+    fn refresh_cooldown_for_request(
+        &self, entries: &[CredentialEntry], model: Option<&str>, group: Option<&str>,
+    ) -> Option<CredentialRefreshCooldownError> {
+        entries.iter().filter(|entry| !entry.disabled
+            && credential_matches_request(&entry.credentials, model, group)
+            && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported)
+            .filter_map(|entry| entry.refresh_retry_remaining(Instant::now()))
+            .min().map(|retry_after_secs| CredentialRefreshCooldownError { retry_after_secs })
+    }
+
+    /// Callers hold refresh_lock. Check again here so requests queued on that lock
+    /// cannot issue another refresh immediately after the first one fails.
+    async fn refresh_managed_token(
+        &self, id: u64, credentials: &KiroCredentials, proxy: Option<&ProxyConfig>,
+    ) -> anyhow::Result<KiroCredentials> {
+        self.check_refresh_cooldown(id)?;
+        let result = async {
+            let proxy_use = self.prepare_proxy_use(credentials, proxy).await?;
+            refresh_token(credentials, &self.config, proxy_use.proxy()).await
+        }.await;
+        match result {
+            Ok(credentials) => Ok(credentials),
+            Err(error) if error.downcast_ref::<RefreshTokenInvalidError>().is_some()
+                || error.downcast_ref::<InvalidCredentialConfig>().is_some()
+                || matches!(error.downcast_ref::<UpstreamCredentialError>(), Some(UpstreamCredentialError::Suspended))
+                || error.downcast_ref::<UpstreamRateLimitError>().is_some()
+                || error.downcast_ref::<static_ips::StaticIpError>().is_some() => Err(error),
+            Err(error) => {
+                let kind = import_transport_failure(&error).unwrap_or("上游暂时无法刷新");
+                tracing::warn!(credential_id = id, kind, "Token 刷新临时失败");
+                self.report_refresh_failure(id);
+                self.check_refresh_cooldown(id)?;
+                Err(error)
+            }
+        }
     }
 
     /// 报告指定凭据的 refreshToken 永久失效（invalid_grant）。
@@ -3704,7 +3744,7 @@ impl MultiTokenManager {
         let now = Instant::now();
         let available = entries
             .iter()
-            .filter(|e| !e.disabled && !(e.credentials.static_ip_required && e.credentials.proxy_url.is_none()) && !e.throttled_until.map(|t| t > now).unwrap_or(false))
+            .filter(|e| !e.disabled && e.refresh_retry_remaining(now).is_none() && !(e.credentials.static_ip_required && e.credentials.proxy_url.is_none()) && !e.throttled_until.map(|t| t > now).unwrap_or(false))
             .count();
 
         ManagerSnapshot {
@@ -3763,6 +3803,7 @@ impl MultiTokenManager {
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
                     disabled_reason: e.disabled_reason.map(|reason| reason.as_str().to_string()),
+                    refresh_retry_remaining_secs: e.refresh_retry_remaining(now),
                     throttled_remaining_secs: e
                         .throttled_until
                         .and_then(|t| t.checked_duration_since(now))
@@ -3795,6 +3836,8 @@ impl MultiTokenManager {
                 // 启用时重置失败计数
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
+                entry.refresh_retry_at = None;
+                entry.transient_failure_count = 0;
                 entry.disabled_reason = None;
                 entry.throttled_until = None;
                 entry.clear_self_heal_streak();
@@ -4084,6 +4127,7 @@ impl MultiTokenManager {
     }
 
     async fn get_usage_limits_for_inner(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
+        self.check_refresh_cooldown(id)?;
         let _static_ip_lease = self.static_ip_lease(id)?;
         let credentials = {
             let entries = self.entries.lock();
@@ -4107,6 +4151,7 @@ impl MultiTokenManager {
 
             if needs_refresh {
                 let _guard = self.refresh_lock.lock().await;
+                self.check_refresh_cooldown(id)?;
                 let current_creds = {
                     let entries = self.entries.lock();
                     entries
@@ -4119,10 +4164,8 @@ impl MultiTokenManager {
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                     let global_proxy = self.proxy.lock().clone();
                     let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
-                    let _proxy_use = self.prepare_proxy_use(&current_creds, effective_proxy.as_ref()).await?;
-                    let effective_proxy = _proxy_use.proxy().cloned();
                     let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
+                        self.refresh_managed_token(id, &current_creds, effective_proxy.as_ref())
                             .await?;
                     {
                         let mut entries = self.entries.lock();
@@ -4244,6 +4287,7 @@ impl MultiTokenManager {
     /// kiroApiKey；OAuth 凭据按需在 `refresh_lock` 内刷新并持久化。返回的凭据是
     /// 刷新后重新读取的最新快照，调用方据此构造请求。
     async fn prepare_request_token(&self, id: u64) -> anyhow::Result<(String, KiroCredentials)> {
+        self.check_refresh_cooldown(id)?;
         let credentials = {
             let entries = self.entries.lock();
             entries
@@ -4261,6 +4305,7 @@ impl MultiTokenManager {
                 .ok_or_else(|| InvalidCredentialConfig("API Key 凭据缺少 kiroApiKey".into()))?
         } else if is_token_expired(&credentials) || is_token_expiring_soon(&credentials) {
             let _guard = self.refresh_lock.lock().await;
+            self.check_refresh_cooldown(id)?;
             let current_creds = {
                 let entries = self.entries.lock();
                 entries
@@ -4273,10 +4318,8 @@ impl MultiTokenManager {
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 let global_proxy = self.proxy.lock().clone();
                 let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
-                let _proxy_use = self.prepare_proxy_use(&current_creds, effective_proxy.as_ref()).await?;
-                let effective_proxy = _proxy_use.proxy().cloned();
                 let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                    self.refresh_managed_token(id, &current_creds, effective_proxy.as_ref()).await?;
                 {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -4348,6 +4391,7 @@ impl MultiTokenManager {
         id: u64,
         overage_status: &str,
     ) -> anyhow::Result<()> {
+        self.check_refresh_cooldown(id)?;
         let _static_ip_lease = self.static_ip_lease(id)?;
         // 仅接受 "ENABLED" / "DISABLED"，其它值早 fail
         if overage_status != "ENABLED" && overage_status != "DISABLED" {
@@ -4376,6 +4420,7 @@ impl MultiTokenManager {
 
             if needs_refresh {
                 let _guard = self.refresh_lock.lock().await;
+                self.check_refresh_cooldown(id)?;
                 let current_creds = {
                     let entries = self.entries.lock();
                     entries
@@ -4388,10 +4433,8 @@ impl MultiTokenManager {
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                     let global_proxy = self.proxy.lock().clone();
                     let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
-                    let _proxy_use = self.prepare_proxy_use(&current_creds, effective_proxy.as_ref()).await?;
-                    let effective_proxy = _proxy_use.proxy().cloned();
                     let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
+                        self.refresh_managed_token(id, &current_creds, effective_proxy.as_ref())
                             .await?;
                     {
                         let mut entries = self.entries.lock();
@@ -4706,6 +4749,8 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
                 throttled_until: None,
+                refresh_retry_at: None,
+                transient_failure_count: 0,
                 rpm_window: VecDeque::new(),
                     active_requests: Arc::new(AtomicU32::new(0)),
                     proxy_operations,
@@ -5086,11 +5131,13 @@ impl MultiTokenManager {
     }
 
     async fn force_refresh_token_for_inner(&self, id: u64) -> anyhow::Result<()> {
+        self.check_refresh_cooldown(id)?;
         let _static_ip_lease = self.static_ip_lease(id)?;
         {
             // Read after locking so token rotation or relogin cannot leave this refresh with a
             // stale refresh token or OIDC client registration snapshot.
             let _guard = self.refresh_lock.lock().await;
+            self.check_refresh_cooldown(id)?;
             let credentials = {
                 let entries = self.entries.lock();
                 entries
@@ -5103,10 +5150,8 @@ impl MultiTokenManager {
             // 无条件调用 refresh_token
             let global_proxy = self.proxy.lock().clone();
             let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
-            let _proxy_use = self.prepare_proxy_use(&credentials, effective_proxy.as_ref()).await?;
-            let effective_proxy = _proxy_use.proxy().cloned();
             let new_creds =
-                refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+                self.refresh_managed_token(id, &credentials, effective_proxy.as_ref()).await?;
 
             // 更新 entries 中对应凭据
             let mut entries = self.entries.lock();
@@ -6041,6 +6086,8 @@ mod tests {
         .unwrap();
         let new_refresh_token = "new-refresh-token-".repeat(10);
         let new_expires_at = "2026-07-28T04:00:00Z".to_string();
+        // A user-supplied replacement login must bypass a previous transport cooldown.
+        manager.entries.lock()[0].refresh_retry_at = Some(Instant::now() + StdDuration::from_secs(30));
 
         manager
             .replace_idc_relogin_credentials(
@@ -6060,6 +6107,7 @@ mod tests {
             .unwrap();
 
         let stored = manager.clone_all_credentials().remove(0);
+        assert_eq!(manager.snapshot().entries[0].refresh_retry_remaining_secs, None);
         assert_eq!(stored.access_token.as_deref(), Some("new-access-token"));
         assert_eq!(
             stored.refresh_token.as_deref(),
@@ -7308,56 +7356,80 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_token_manager_report_refresh_failure() {
-        let config = Config::default();
-        let cred1 = KiroCredentials::default();
-        let cred2 = KiroCredentials::default();
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-
-        assert_eq!(manager.available_count(), 2);
-        for _ in 0..(MAX_FAILURES_PER_CREDENTIAL - 1) {
+    fn refresh_failure_backs_off_without_disabling_and_deduplicates_waiters() {
+        let manager = MultiTokenManager::new(Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()], None, None, false).unwrap();
+        for expected in [30, 60, 120, 240, 300, 300] {
             assert!(manager.report_refresh_failure(1));
+            let before = manager.snapshot().entries[0].refresh_failure_count;
+            // Already queued failures must not repeatedly extend the same cooldown.
+            for _ in 0..5 { manager.report_refresh_failure(1); }
+            let snapshot = manager.snapshot();
+            assert!(!snapshot.entries[0].disabled);
+            assert_eq!(snapshot.entries[0].disabled_reason, None);
+            assert_eq!(snapshot.entries[0].refresh_failure_count, before);
+            assert_eq!(snapshot.entries[0].refresh_retry_remaining_secs, Some(expected));
+            assert_eq!(manager.available_count(), 1);
+            assert!(manager.try_acquire_permit(1).is_none());
+            manager.entries.lock()[0].refresh_retry_at = Some(Instant::now() - StdDuration::from_secs(1));
         }
-        assert_eq!(manager.available_count(), 2);
-
-        assert!(manager.report_refresh_failure(1));
-        assert_eq!(manager.available_count(), 1);
-
-        let snapshot = manager.snapshot();
-        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
-        assert!(first.disabled);
-        assert_eq!(first.refresh_failure_count, MAX_FAILURES_PER_CREDENTIAL);
-        assert_eq!(snapshot.current_id, 2);
     }
 
     #[tokio::test]
-    async fn test_multi_token_manager_refresh_failure_disabled_is_not_auto_recovered() {
-        let config = Config::default();
-        let cred1 = KiroCredentials::default();
-        let cred2 = KiroCredentials::default();
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-
-        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
-            manager.report_refresh_failure(1);
-            manager.report_refresh_failure(2);
+    async fn refresh_cooldown_expires_and_rejoins_without_manual_reset() {
+        let cred = KiroCredentials { access_token: Some("fixture-token".into()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()), ..Default::default() };
+        let manager = MultiTokenManager::new(Config::default(), vec![cred.clone(), cred], None, None, false).unwrap();
+        manager.report_refresh_failure(1);
+        manager.report_refresh_failure(2);
+        let error = manager.acquire_context(None, None).await.err().unwrap();
+        assert!(error.downcast_ref::<CredentialRefreshCooldownError>().is_some());
+        assert!(manager.snapshot().entries.iter().all(|entry| !entry.disabled));
+        for entry in manager.entries.lock().iter_mut() {
+            entry.refresh_retry_at = Some(Instant::now() - StdDuration::from_secs(1));
         }
-        assert_eq!(manager.available_count(), 0);
+        let context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(context.token, "fixture-token");
+        assert_eq!(manager.available_count(), 2);
+        assert_eq!(manager.snapshot().entries.iter().find(|entry| entry.id == context.id).unwrap().refresh_failure_count, 0);
+    }
 
-        let err = manager
-            .acquire_context(None, None)
-            .await
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(
-            err.contains("所有凭据均已禁用"),
-            "错误应提示所有凭据禁用，实际: {}",
-            err
-        );
+    #[tokio::test]
+    async fn refresh_proxy_disconnect_cools_and_blocks_background_and_queued_refreshes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+        let cred = KiroCredentials { refresh_token: Some("fixture-refresh-".repeat(20)), ..Default::default() };
+        let manager = MultiTokenManager::new(Config::default(), vec![cred.clone()], None, None, false).unwrap();
+        let proxy = ProxyConfig::new(format!("http://{address}"));
+        let error = manager.refresh_managed_token(1, &cred, Some(&proxy)).await.err().unwrap();
+        assert!(error.downcast_ref::<CredentialRefreshCooldownError>().is_some());
+        server.await.unwrap();
+        for error in [manager.try_ensure_token(1, &cred).await.err().unwrap(),
+            manager.get_usage_limits_for(1).await.err().unwrap(),
+            manager.prepare_request_token(1).await.err().unwrap(),
+            manager.force_refresh_token_for(1).await.err().unwrap()] {
+            assert!(error.downcast_ref::<CredentialRefreshCooldownError>().is_some());
+        }
+        let snapshot = manager.snapshot();
+        assert!(!snapshot.entries[0].disabled);
+        assert_eq!(snapshot.entries[0].refresh_failure_count, 1);
+    }
+
+    #[test]
+    fn refresh_cooldown_does_not_revive_manual_or_invalid_credentials() {
+        let manager = MultiTokenManager::new(Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()], None, None, false).unwrap();
+        manager.set_disabled(1, true).unwrap();
+        manager.report_refresh_token_invalid(2);
+        for _ in 0..6 { manager.report_refresh_failure(1); manager.report_refresh_failure(2); }
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries[0].disabled_reason.as_deref(), Some("Manual"));
+        assert_eq!(snapshot.entries[1].disabled_reason.as_deref(), Some("InvalidRefreshToken"));
+        assert!(snapshot.entries.iter().all(|entry| entry.disabled && entry.refresh_retry_remaining_secs.is_none()));
     }
 
     #[test]

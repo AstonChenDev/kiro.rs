@@ -21,6 +21,13 @@ pub struct UpstreamModelUnavailableError {
     pub retry_after: String,
 }
 
+/// A transient token-refresh failure. The account stays enabled and retains its proxy.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("账号网络或刷新暂时失败，冷却 {retry_after_secs} 秒后自动重试")]
+pub struct CredentialRefreshCooldownError {
+    pub retry_after_secs: u64,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("upstream response deadline exceeded")]
 pub struct UpstreamTimeoutError {

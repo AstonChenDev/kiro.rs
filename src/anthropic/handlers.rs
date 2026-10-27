@@ -449,6 +449,16 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 pub(super) fn map_provider_error(err: Error) -> Response {
+    if let Some(cooldown) = err.downcast_ref::<crate::kiro::error::CredentialRefreshCooldownError>() {
+        let mut response = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new("api_error", cooldown.to_string())),
+        ).into_response();
+        if let Ok(value) = cooldown.retry_after_secs.to_string().parse() {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return response;
+    }
     if let Some(reason) = crate::kiro::error::credential_error_reason(&err) {
         return (StatusCode::FORBIDDEN, Json(ErrorResponse::new("permission_error", reason))).into_response();
     }
@@ -2688,6 +2698,14 @@ mod tests {
             "ValidationException: transient backend issue".to_string()
         ));
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn refresh_cooldown_maps_to_503_with_retry_after() {
+        let error = crate::kiro::error::CredentialRefreshCooldownError { retry_after_secs: 60 };
+        let response = map_provider_error(error.into());
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "60");
     }
 
     #[test]

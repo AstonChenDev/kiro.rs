@@ -267,7 +267,7 @@ impl KiroProvider {
                 self.profile_resolution_attempted.lock().insert(ctx.id);
             }
             Err(e) => {
-                if is_rate_limit_error(&e) {
+                if is_rate_limit_error(&e) || e.downcast_ref::<crate::kiro::error::CredentialRefreshCooldownError>().is_some() {
                     return Err(e);
                 }
                 // 网络/瞬态错误：不标记，下次请求再试；本次按原 profileArn 继续
@@ -395,7 +395,7 @@ impl KiroProvider {
             let mut ctx = match self.token_manager.acquire_context(None, group).await {
                 Ok(c) => c,
                 Err(e) => {
-                    if is_rate_limit_error(&e) {
+                    if is_rate_limit_error(&e) || e.downcast_ref::<crate::kiro::error::CredentialRefreshCooldownError>().is_some() {
                         Self::emit_attempt(
                             sink,
                             attempt,
@@ -528,7 +528,8 @@ impl KiroProvider {
                         Some(&e.to_string()),
                         attempt_start,
                     );
-                    // 凭据专属代理故障时，跳过该凭据换下一个。
+                    // Transport failures are temporary, even without a dedicated proxy.
+                    self.token_manager.report_network_failure(ctx.id);
                     let has_own_proxy = ctx
                         .credentials
                         .proxy_url
@@ -536,8 +537,6 @@ impl KiroProvider {
                         .is_some_and(|u| !u.trim().is_empty());
                     if has_own_proxy {
                         tracing::warn!("凭据 #{} 有专属代理且 MCP 请求失败，跳过该凭据", ctx.id);
-                        self.token_manager
-                            .report_failure_for_request(ctx.id, None, group);
                     }
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
@@ -801,7 +800,7 @@ impl KiroProvider {
                     c
                 }
                 Err(e) => {
-                    if is_rate_limit_error(&e) {
+                    if is_rate_limit_error(&e) || e.downcast_ref::<crate::kiro::error::CredentialRefreshCooldownError>().is_some() {
                         Self::emit_attempt(
                             sink, attempt, 0, "", None, outcome::TRANSIENT,
                             Some(&e.to_string()), attempt_start,
@@ -900,11 +899,11 @@ impl KiroProvider {
                         sink, attempt, ctx.id, endpoint_name, None,
                         outcome::NETWORK_ERROR, Some(&e.to_string()), attempt_start,
                     );
+                    self.token_manager.report_network_failure(ctx.id);
                     if e.is_timeout() {
                         return Err(UpstreamTimeoutError { source: e }.into());
                     }
-                    // 凭据专属代理故障时，重试同一凭据无意义，应跳过该凭据换下一个。
-                    // 没有专属代理时（直连或仅全局代理），切换凭据不解决问题，保持重试。
+                    // Keep the account enabled; retry another eligible account during cooldown.
                     let has_own_proxy = ctx.credentials.proxy_url.as_deref()
                         .map_or(false, |u| !u.trim().is_empty());
                     if has_own_proxy {
@@ -912,8 +911,6 @@ impl KiroProvider {
                             "凭据 #{} 有专属代理且网络请求失败，跳过该凭据",
                             ctx.id
                         );
-                        self.token_manager
-                            .report_failure_for_request(ctx.id, model.as_deref(), group);
                     }
 
                     last_error = Some(e.into());
@@ -1403,7 +1400,8 @@ impl KiroProvider {
     fn handle_force_refresh_result(result: anyhow::Result<()>) -> anyhow::Result<bool> {
         match result {
             Ok(()) => Ok(true),
-            Err(error) if is_rate_limit_error(&error) => Err(error),
+            Err(error) if is_rate_limit_error(&error)
+                || error.downcast_ref::<crate::kiro::error::CredentialRefreshCooldownError>().is_some() => Err(error),
             Err(_) => Ok(false),
         }
     }
@@ -1416,7 +1414,9 @@ fn is_rate_limit_error(error: &anyhow::Error) -> bool {
 fn take_rate_limit_error(last_error: &mut Option<anyhow::Error>) -> Option<anyhow::Error> {
     if last_error
         .as_ref()
-        .is_some_and(|error| error.downcast_ref::<UpstreamRateLimitError>().is_some() || crate::kiro::error::credential_error_reason(error).is_some())
+        .is_some_and(|error| error.downcast_ref::<UpstreamRateLimitError>().is_some()
+            || error.downcast_ref::<crate::kiro::error::CredentialRefreshCooldownError>().is_some()
+            || crate::kiro::error::credential_error_reason(error).is_some())
     {
         last_error.take()
     } else {

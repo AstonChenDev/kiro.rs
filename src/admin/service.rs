@@ -897,6 +897,7 @@ impl AdminService {
                     proxy_url: entry.proxy_url,
                     refresh_failure_count: entry.refresh_failure_count,
                     disabled_reason: entry.disabled_reason,
+                    refresh_retry_remaining_secs: entry.refresh_retry_remaining_secs,
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
@@ -3329,6 +3330,9 @@ impl AdminService {
 
     /// 分类简单操作错误（set_disabled, set_priority, reset_and_enable）
     fn classify_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        if let Some(cooldown) = e.downcast_ref::<crate::kiro::error::CredentialRefreshCooldownError>() {
+            return AdminServiceError::RefreshCooldown { retry_after_secs: cooldown.retry_after_secs };
+        }
         if e.downcast_ref::<crate::kiro::token_manager::static_ips::StaticIpError>().is_some() { return AdminServiceError::InvalidRequest(e.to_string()); }
         if let Some(reason) = crate::kiro::error::credential_error_reason(&e) { return AdminServiceError::InvalidCredential(reason); }
         if let Some(error) = classify_rate_limit(&e) {
@@ -3344,6 +3348,9 @@ impl AdminService {
 
     /// 分类余额查询错误（可能涉及上游 API 调用）
     fn classify_balance_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        if let Some(cooldown) = e.downcast_ref::<crate::kiro::error::CredentialRefreshCooldownError>() {
+            return AdminServiceError::RefreshCooldown { retry_after_secs: cooldown.retry_after_secs };
+        }
         if e.downcast_ref::<crate::kiro::token_manager::static_ips::StaticIpError>().is_some() { return AdminServiceError::InvalidRequest(e.to_string()); }
         if let Some(reason) = crate::kiro::error::credential_error_reason(&e) { return AdminServiceError::InvalidCredential(reason); }
         if let Some(error) = classify_rate_limit(&e) {

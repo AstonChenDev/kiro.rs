@@ -456,6 +456,19 @@ function CredentialCardImpl({
   const [throttleRemaining, setThrottleRemaining] = useState<number>(
     credential.throttledRemainingSecs ?? 0,
   );
+  const [refreshRetryRemaining, setRefreshRetryRemaining] = useState(
+    credential.refreshRetryRemainingSecs ?? 0,
+  );
+  useEffect(() => {
+    setRefreshRetryRemaining(credential.refreshRetryRemainingSecs ?? 0);
+  }, [credential.refreshRetryRemainingSecs]);
+  useEffect(() => {
+    if (refreshRetryRemaining <= 0) return;
+    const timer = window.setInterval(() => {
+      setRefreshRetryRemaining((seconds) => Math.max(0, seconds - 1));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [refreshRetryRemaining]);
   useEffect(() => {
     setThrottleRemaining(credential.throttledRemainingSecs ?? 0);
   }, [credential.throttledRemainingSecs]);
@@ -593,7 +606,7 @@ function CredentialCardImpl({
   const reasonStyle = getDisabledReasonStyle(credential.disabledReason);
   const isThrottled = !credential.disabled && throttleRemaining > 0;
 
-  const disposition = getDisposition(credential, balance, throttleRemaining);
+  const disposition = getDisposition(credential, balance, throttleRemaining, refreshRetryRemaining);
 
   const runDisposition = () => {
     switch (disposition.action) {
@@ -676,11 +689,18 @@ function CredentialCardImpl({
           冷却 {formatThrottleCountdown(throttleRemaining)}
         </Badge>
       )}
+      {!credential.disabled && refreshRetryRemaining > 0 && (
+        <Badge variant="warning" className="text-[11px]"
+          title="网络或 Token 刷新临时失败，冷却到期后自动重试，保留原静态 IP">
+          <Clock className="mr-1 h-3 w-3 inline" />
+          网络/刷新冷却 {formatThrottleCountdown(refreshRetryRemaining)}
+        </Badge>
+      )}
     </>
   );
 
   const hasStatusBadges =
-    credential.disabled || isQuotaExceeded || isThrottled;
+    credential.disabled || isQuotaExceeded || isThrottled || refreshRetryRemaining > 0;
 
   const subscriptionTitle = balance?.subscriptionTitle ?? credential.subscriptionTitle;
   const subscriptionBadge = subscriptionTitle ? (
@@ -740,7 +760,8 @@ function CredentialCardImpl({
           disabled={
             statusChanging || resetFailure.isPending ||
             (credential.failureCount === 0 &&
-              credential.refreshFailureCount === 0)
+              credential.refreshFailureCount === 0 &&
+              refreshRetryRemaining === 0)
           }
         >
           <RotateCcw className="mr-2 h-4 w-4" />

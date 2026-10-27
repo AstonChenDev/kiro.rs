@@ -727,6 +727,29 @@ mod tests {
     fn account(name: &str) -> KiroCredentials {
         KiroCredentials { refresh_token:Some(name.repeat(120)), access_token:Some("test-access".into()), expires_at:Some("2099-01-01T00:00:00Z".into()), auth_method:Some("social".into()), provider:Some("Github".into()), ..Default::default() }
     }
+
+    #[test]
+    fn temporary_refresh_and_proxy_failures_keep_exclusive_ip_occupied() {
+        let mut credential = account("refresh-cooldown");
+        credential.id = Some(1);
+        let m = manager(None, vec![credential]);
+        m.static_ip_import(vec![input("192.0.2.10")]).unwrap();
+        m.static_ip_bind(1, Some(1)).unwrap();
+        let before = m.clone_credential(1).unwrap();
+        m.report_refresh_failure(1);
+        m.reconcile_static_ips().unwrap();
+        let after = m.clone_credential(1).unwrap();
+        assert!(!after.disabled);
+        assert_eq!(after.proxy_url, before.proxy_url);
+        assert_eq!(m.static_ip_list().entries[0].status, "occupied");
+        assert!(m.static_ip_list().waiting_credential_ids.is_empty());
+        m.set_disabled(1, false).unwrap();
+        m.report_network_failure(1);
+        assert_eq!(m.static_ip_list().entries[0].status, "occupied");
+        assert_eq!(m.snapshot().entries[0].failure_count, 0);
+        assert_eq!(m.snapshot().entries[0].refresh_failure_count, 0);
+        assert!(m.try_acquire_permit(1).is_none());
+    }
     fn manager(path: Option<PathBuf>, creds: Vec<KiroCredentials>) -> Arc<MultiTokenManager> {
         let manager = Arc::new(MultiTokenManager::new(Config::default(),creds,None,path,true).unwrap());
         *manager.test_import_initializer.lock() = Some(Arc::new(|c, _| Box::pin(async move {

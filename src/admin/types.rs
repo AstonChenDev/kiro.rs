@@ -76,6 +76,8 @@ pub struct CredentialStatusItem {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_retry_remaining_secs: Option<u64>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
     /// 账号所属分组（可属于多个分组）

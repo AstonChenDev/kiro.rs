@@ -686,6 +686,27 @@ async fn gateway_chat_tool_arguments_and_final_usage_are_complete() {
 }
 
 #[tokio::test]
+async fn gateway_proxy_transport_failure_cools_without_disabling_or_repeating_requests() {
+    let f = fixture(Mode::Normal(Duration::ZERO)).await;
+    let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = format!("http://{}", unavailable.local_addr().unwrap());
+    drop(unavailable);
+    f.manager.update_credential(1, None, Some(Some(proxy)), None, None, None, None, None).unwrap();
+
+    for endpoint in ["messages", "chat", "responses", "messages"] {
+        let response = request(f.state.clone(), endpoint, false).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{endpoint}");
+        assert!(response.headers().contains_key("retry-after"), "{endpoint}");
+    }
+    let snapshot = f.manager.snapshot();
+    assert!(!snapshot.entries[0].disabled);
+    assert_eq!(snapshot.entries[0].failure_count, 0);
+    assert_eq!(snapshot.entries[0].refresh_failure_count, 0);
+    assert!(snapshot.entries[0].refresh_retry_remaining_secs.is_some());
+    assert_eq!(f.calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
 async fn gateway_content_filter_refusal_is_not_a_successful_end_turn() {
     let f = fixture(Mode::Refused).await;
     async fn text(response: Response) -> String {

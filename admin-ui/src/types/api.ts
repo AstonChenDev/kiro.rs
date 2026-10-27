@@ -94,6 +94,8 @@ export interface CredentialStatusItem {
   disabledReason?: string
   /** 账号级限流冷却剩余秒数（>0 表示冷却中） */
   throttledRemainingSecs?: number
+  /** 临时网络或 Token 刷新失败的重试冷却；账号仍保持启用和原静态 IP。 */
+  refreshRetryRemainingSecs?: number
   endpoint: string
   /** 账号所属分组（可属于多个分组） */
   groups?: string[]

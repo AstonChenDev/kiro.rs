@@ -23,6 +23,7 @@ pub enum AdminServiceError {
 
     /// 上游明确返回限流，可选携带合法 Retry-After。
     RateLimited { retry_after: Option<String> },
+    RefreshCooldown { retry_after_secs: u64 },
 
     /// 内部状态错误
     InternalError(String),
@@ -44,6 +45,7 @@ impl fmt::Display for AdminServiceError {
             }
             AdminServiceError::UpstreamError(_) => write!(f, "上游服务请求失败"),
             AdminServiceError::RateLimited { .. } => write!(f, "上游请求过于频繁，请稍后重试"),
+            AdminServiceError::RefreshCooldown { retry_after_secs } => write!(f, "账号网络或刷新暂时失败，冷却 {} 秒后自动重试", retry_after_secs),
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
             AdminServiceError::InvalidRequest(msg) => write!(f, "请求无效: {}", msg),
             AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
@@ -61,6 +63,7 @@ impl AdminServiceError {
             AdminServiceError::NotFound { .. } => StatusCode::NOT_FOUND,
             AdminServiceError::UpstreamError(_) => StatusCode::BAD_GATEWAY,
             AdminServiceError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+            AdminServiceError::RefreshCooldown { .. } => StatusCode::SERVICE_UNAVAILABLE,
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             AdminServiceError::InvalidCredential(_) => StatusCode::FORBIDDEN,
@@ -73,6 +76,7 @@ impl AdminServiceError {
             AdminServiceError::ImportNetwork { .. } => AdminErrorResponse::api_error(self.to_string()),
             AdminServiceError::NotFound { .. } => AdminErrorResponse::not_found(self.to_string()),
             AdminServiceError::UpstreamError(_) => AdminErrorResponse::api_error(self.to_string()),
+            AdminServiceError::RefreshCooldown { .. } => AdminErrorResponse::api_error(self.to_string()),
             AdminServiceError::RateLimited { .. } => {
                 AdminErrorResponse::rate_limit(self.to_string())
             }
@@ -94,6 +98,7 @@ impl AdminServiceError {
         }
         let retry_after = match &self {
             AdminServiceError::RateLimited { retry_after } => retry_after.clone(),
+            AdminServiceError::RefreshCooldown { retry_after_secs } => Some(retry_after_secs.to_string()),
             _ => None,
         };
         let status = self.status_code();

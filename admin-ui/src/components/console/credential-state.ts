@@ -51,10 +51,9 @@ export interface CredentialDisposition {
   destructive?: boolean
 }
 
-/** 鉴权 / token 类禁用原因 —— 这些必须重新登录才能恢复 */
+/** 明确的鉴权 / 配置类禁用原因。临时刷新失败不等于凭据失效。 */
 const AUTH_REASONS = new Set([
   'InvalidRefreshToken',
-  'TooManyRefreshFailures',
   'InvalidConfig',
 ])
 
@@ -73,6 +72,7 @@ export function getDisposition(
   c: CredentialStatusItem,
   balance?: BalanceResponse | null,
   throttleRemaining = c.throttledRemainingSecs ?? 0,
+  refreshRetryRemaining = c.refreshRetryRemainingSecs ?? 0,
 ): CredentialDisposition {
   const reason = c.disabledReason
 
@@ -99,6 +99,9 @@ export function getDisposition(
         action: 'relogin',
       }
     }
+    if (reason === 'TooManyRefreshFailures') {
+      return { state: 'otherDisabled', tone: 'warn', stateLabel: '已禁用 · 历史刷新失败', actionLabel: '启用', action: 'enable' }
+    }
     if (reason && AUTH_REASONS.has(reason)) {
       return {
         state: 'authFailed',
@@ -106,9 +109,7 @@ export function getDisposition(
         stateLabel:
           reason === 'InvalidRefreshToken'
             ? '已禁用 · Token 失效'
-            : reason === 'TooManyRefreshFailures'
-              ? '已禁用 · 刷新失败过多'
-              : '已禁用 · 配置无效',
+            : '已禁用 · 配置无效',
         actionLabel: '重新登录',
         action: 'relogin',
       }
@@ -141,6 +142,10 @@ export function getDisposition(
     }
   }
 
+  if (refreshRetryRemaining > 0) {
+    return { state: 'refreshFailing', tone: 'cool', stateLabel: '网络/刷新冷却中 · 自动重试', actionLabel: null, action: 'none' }
+  }
+
   // 未禁用但在限流冷却中：会自己恢复，所以是 cool 而非 warn
   if (throttleRemaining > 0) {
     return {
@@ -162,7 +167,7 @@ export function getDisposition(
     }
   }
 
-  // 刷新在失败但还没到禁用阈值 —— 这是唯一能提前干预的窗口
+  // 冷却已经结束，下一次请求会自动重试，也允许手动刷新。
   if (c.refreshFailureCount > 0) {
     return {
       state: 'refreshFailing',
