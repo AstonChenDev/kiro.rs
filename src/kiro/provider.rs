@@ -26,6 +26,9 @@ use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
+#[cfg(test)]
+mod proxy_tests;
+
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
@@ -50,7 +53,7 @@ const CLIENT_CACHE_CAP: usize = 64;
 /// 带容量上限的 HTTP Client 缓存。
 ///
 /// - key 为 effective proxy 配置（None = 直连/全局回退）
-/// - 受保护 key（全局代理对应的 effective 配置）永不被淘汰
+/// - 受保护 key 始终跟随当前全局代理，旧全局代理切换后释放缓存引用
 /// - 超出容量时按插入顺序淘汰最旧的「非受保护」条目
 struct ClientCache {
     map: HashMap<Option<ProxyConfig>, Client>,
@@ -75,6 +78,16 @@ impl ClientCache {
 
     fn get(&self, key: &Option<ProxyConfig>) -> Option<Client> {
         self.map.get(key).cloned()
+    }
+
+    /// 切换全局代理时释放旧连接池；在途请求持有的 Client 克隆仍可完成响应。
+    fn set_global_proxy(&mut self, proxy: Option<ProxyConfig>) {
+        if self.protected != proxy {
+            self.map.remove(&self.protected);
+            // 新全局代理可能原本是凭据专属代理，升级为常驻条目后不再参与淘汰。
+            self.order.retain(|key| key != &proxy);
+            self.protected = proxy;
+        }
     }
 
     /// 插入新条目，必要时淘汰最旧的非受保护条目
@@ -117,8 +130,6 @@ struct McpCallResult {
 /// 按凭据 `endpoint` 字段选择 [`KiroEndpoint`] 实现
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
-    /// 全局代理配置（用于凭据无自定义代理时的回退）
-    global_proxy: Option<ProxyConfig>,
     /// Client 缓存：key = effective proxy config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client。
     /// 带容量上限淘汰（全局代理 client 常驻），避免代理数量增长导致内存无界增长。
@@ -135,8 +146,6 @@ pub struct KiroProvider {
     /// `ListAvailableProfiles`。命中真实 ARN 的账号会把 ARN 持久化进凭据，之后
     /// 通过 `streaming_profile_arn()` 直接命中，不再进入解析路径。
     profile_resolution_attempted: Mutex<HashSet<u64>>,
-    /// Short per-model cooldowns prevent concurrent clients from amplifying overload.
-    model_cooldowns: Mutex<HashMap<String, Instant>>,
 }
 
 impl KiroProvider {
@@ -145,16 +154,14 @@ impl KiroProvider {
         &self.token_manager
     }
 
-    /// 创建带代理配置和端点注册表的 KiroProvider 实例
+    /// 创建 KiroProvider；全局代理始终从共享凭据管理器读取。
     ///
     /// # Arguments
     /// * `token_manager` - 多凭据 Token 管理器
-    /// * `proxy` - 全局代理配置
     /// * `endpoints` - 端点名 → 实现的注册表（至少包含 `default_endpoint` 对应条目）
     /// * `default_endpoint` - 凭据未显式指定 endpoint 时使用的名称
-    pub fn with_proxy(
+    pub fn new(
         token_manager: Arc<MultiTokenManager>,
-        proxy: Option<ProxyConfig>,
         endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
         default_endpoint: String,
     ) -> Self {
@@ -164,6 +171,7 @@ impl KiroProvider {
             default_endpoint
         );
         let tls_backend = token_manager.config().tls_backend;
+        let proxy = token_manager.proxy();
         // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）
         let config = token_manager.config();
         let initial_client = build_client_with_timeouts(
@@ -178,19 +186,20 @@ impl KiroProvider {
 
         Self {
             token_manager,
-            global_proxy: proxy,
             client_cache: Mutex::new(client_cache),
             tls_backend,
             endpoints,
             default_endpoint,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
-            model_cooldowns: Mutex::new(HashMap::new()),
         }
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for_proxy(&self, effective: Option<ProxyConfig>) -> anyhow::Result<Client> {
         let mut cache = self.client_cache.lock();
+        // 在缓存锁内读取最新代理，避免并发请求用旧快照将缓存切回旧全局代理。
+        let global_proxy = self.token_manager.proxy();
+        cache.set_global_proxy(global_proxy);
         if let Some(client) = cache.get(&effective) {
             return Ok(client);
         }
@@ -204,6 +213,18 @@ impl KiroProvider {
         )?;
         cache.insert(effective, client.clone());
         Ok(client)
+    }
+
+    /// Snapshot the hot global proxy once per attempt and keep static/DNS ownership
+    /// pinned through the response. Cache refresh must not bypass that guard.
+    async fn prepare_client(
+        &self, credentials: &KiroCredentials,
+    ) -> anyhow::Result<(Client, crate::kiro::token_manager::static_ips::ProxyUse)> {
+        let global_proxy = self.token_manager.proxy();
+        let effective = credentials.effective_proxy(global_proxy.as_ref());
+        let proxy_use = self.token_manager.prepare_proxy_use(credentials, effective.as_ref()).await?;
+        let client = self.client_for_proxy(proxy_use.proxy().cloned())?;
+        Ok((client, proxy_use))
     }
 
     /// 根据凭据选择 endpoint 实现
@@ -480,24 +501,7 @@ impl KiroProvider {
             let url = endpoint.mcp_url(&rctx);
             let body = endpoint.transform_mcp_body(request_body, &rctx);
 
-            let effective_proxy = ctx.credentials.effective_proxy(self.global_proxy.as_ref());
-            let proxy_use = self.token_manager.prepare_proxy_use(&ctx.credentials, effective_proxy.as_ref()).await?;
-            let client = match self.client_for_proxy(proxy_use.proxy().cloned()) {
-                Ok(client) => client,
-                Err(e) => {
-                    Self::emit_attempt(
-                        sink,
-                        attempt,
-                        ctx.id,
-                        endpoint_name,
-                        None,
-                        outcome::NETWORK_ERROR,
-                        Some(&e.to_string()),
-                        attempt_start,
-                    );
-                    return Err(e);
-                }
-            };
+            let (client, proxy_use) = self.prepare_client(&ctx.credentials).await?;
             let base = client
                 .post(&url)
                 .body(body)
@@ -762,20 +766,6 @@ impl KiroProvider {
         // 尝试从请求体中提取模型与会话标识
         let (model, session_id) = Self::extract_routing_hints(request_body);
 
-        if let Some(model) = model.as_ref() {
-            let now = Instant::now();
-            let mut cooldowns = self.model_cooldowns.lock();
-            cooldowns.retain(|_, until| *until > now);
-            if let Some(until) = cooldowns.get(&model.to_ascii_lowercase()) {
-                let remaining = until.saturating_duration_since(now);
-                let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
-                return Err(UpstreamModelUnavailableError {
-                    retry_after: seconds.max(1).to_string(),
-                }
-                .into());
-            }
-        }
-
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）；同一会话优先沿用上一轮凭据
@@ -866,9 +856,7 @@ impl KiroProvider {
             tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
             tracing::debug!("实际发送请求体: {}", body);
 
-            let effective_proxy = ctx.credentials.effective_proxy(self.global_proxy.as_ref());
-            let proxy_use = self.token_manager.prepare_proxy_use(&ctx.credentials, effective_proxy.as_ref()).await?;
-            let client = self.client_for_proxy(proxy_use.proxy().cloned())?;
+            let (client, proxy_use) = self.prepare_client(&ctx.credentials).await?;
             let base = client.post(&url)
                 .body(body)
                 .header("content-type", endpoint.content_type());
@@ -983,28 +971,9 @@ impl KiroProvider {
                     Some(&body),
                     attempt_start,
                 );
+                // 只让本次请求失败，不做模型级全局冷却：过载通常只落在个别账号/节点上，
+                // 全局冷却会把一次过载放大成冷却期内该模型的所有请求都直接 503。
                 let delay = retry_after.retry_after().unwrap_or("5").to_string();
-                let seconds = delay
-                    .parse::<u64>()
-                    .ok()
-                    .or_else(|| {
-                        httpdate::parse_http_date(&delay).ok().map(|date| {
-                            date.duration_since(std::time::SystemTime::now())
-                                .unwrap_or_default()
-                                .as_secs()
-                                .saturating_add(1)
-                        })
-                    })
-                    .unwrap_or(5)
-                    .max(1);
-                if let Some(model) = model.as_ref() {
-                    let mut cooldowns = self.model_cooldowns.lock();
-                    let now = Instant::now();
-                    cooldowns.retain(|_, until| *until > now);
-                    if let Some(until) = now.checked_add(Duration::from_secs(seconds)) {
-                        cooldowns.insert(model.to_ascii_lowercase(), until);
-                    }
-                }
                 return Err(UpstreamModelUnavailableError { retry_after: delay }.into());
             }
 

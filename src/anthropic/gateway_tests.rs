@@ -264,7 +264,7 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
         "fixture".to_owned(),
         Arc::new(LocalEndpoint(url)) as Arc<dyn KiroEndpoint>,
     )]);
-    let provider = Arc::new(KiroProvider::with_proxy(manager.clone(), None, endpoints, "fixture".to_owned()));
+    let provider = Arc::new(KiroProvider::new(manager.clone(), endpoints, "fixture".to_owned()));
     let state = AppState::new(false, ToolCompatibilityMode::Raw)
         .with_shared_kiro_provider(provider.clone());
     Fixture {
@@ -579,12 +579,13 @@ async fn gateway_model_overload_does_not_retry_three_times() {
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     assert!(String::from_utf8_lossy(&bytes).contains("overloaded_error"));
     assert_eq!(f.calls.load(Ordering::Relaxed), 1);
+    // 不做模型级冷却：一次过载只影响本次请求，下一个请求照常发往上游。
     let second = request(f.state.clone(), "cc", true).await;
     assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         f.calls.load(Ordering::Relaxed),
-        1,
-        "cooldown still hits overloaded upstream"
+        2,
+        "model overload must not block later requests without trying upstream"
     );
 }
 
