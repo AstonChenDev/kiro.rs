@@ -908,6 +908,79 @@ async fn gateway_active_stream_can_exceed_idle_deadline() {
 }
 
 #[tokio::test]
+async fn gateway_non_stream_deadline_does_not_change_streaming_across_protocols() {
+    for endpoint in ["messages", "cc", "chat", "responses"] {
+        let config: Config = serde_json::from_value(json!({
+            "upstreamTotalTimeoutSecs":3,
+            "upstreamNonStreamTimeoutSecs":1,
+            "upstreamReadTimeoutSecs":5,
+        })).unwrap();
+        let f = fixture_with_config(Mode::Active, config).await;
+        let response = tokio::time::timeout(
+            Duration::from_secs(3), request(f.state.clone(), endpoint, false),
+        ).await.expect("non-stream deadline ignored");
+        assert_ne!(response.status(), StatusCode::OK, "{endpoint}");
+        to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(f.manager.traffic_status()[0].concurrency, 0);
+
+        let response = request(f.state.clone(), endpoint, true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(!body.contains("event: error"), "{endpoint}: {body}");
+        assert!(!body.contains("response.failed"), "{endpoint}: {body}");
+        assert!(body.contains("early content"), "{endpoint}");
+        assert_eq!(f.manager.traffic_status()[0].concurrency, 0);
+    }
+}
+
+#[tokio::test]
+async fn gateway_non_stream_can_outlive_or_disable_stream_total_deadline() {
+    for non_stream in [3, 0] {
+        let config: Config = serde_json::from_value(json!({
+            "upstreamTotalTimeoutSecs":1,
+            "upstreamNonStreamTimeoutSecs":non_stream,
+            "upstreamReadTimeoutSecs":5,
+        })).unwrap();
+        let f = fixture_with_config(Mode::Active, config).await;
+        let response = request(f.state.clone(), "messages", false).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("early content"));
+        assert_eq!(f.manager.traffic_status()[0].concurrency, 0);
+    }
+}
+
+#[tokio::test]
+async fn gateway_search_loop_uses_client_response_mode_for_deadline() {
+    for streaming in [false, true] {
+        let config: Config = serde_json::from_value(json!({
+            "upstreamTotalTimeoutSecs":3,
+            "upstreamNonStreamTimeoutSecs":1,
+            "upstreamReadTimeoutSecs":5,
+        })).unwrap();
+        let f = fixture_with_config(Mode::Active, config).await;
+        let req = json!({
+            "model":"claude-opus-5-5", "max_tokens":1024, "stream":streaming,
+            "messages":[{"role":"user","content":"hello"}],
+            "tools":[
+                {"type":"web_search_20250305","name":"web_search"},
+                {"name":"run","input_schema":{"type":"object"}}
+            ]
+        });
+        let response = request_payload(f.state.clone(), "messages", req).await;
+        assert_eq!(response.status().is_success(), streaming);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        if streaming {
+            assert!(body.contains("event: message_stop"), "{body}");
+            assert!(!body.contains("event: error"), "{body}");
+        }
+        assert_eq!(f.manager.traffic_status()[0].concurrency, 0);
+    }
+}
+
+#[tokio::test]
 async fn gateway_total_deadline_is_configurable_even_for_active_streams() {
     for (total, should_finish) in [(1, false), (3, true)] {
         let config: Config = serde_json::from_value(json!({

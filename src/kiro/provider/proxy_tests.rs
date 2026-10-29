@@ -131,7 +131,7 @@ async fn credential_response(
     target: &LocalServer,
 ) -> String {
     timeout(Duration::from_secs(5), async {
-        let (client, _proxy_use) = provider.prepare_client(credential).await.unwrap();
+        let (client, _proxy_use) = provider.prepare_client(credential, true).await.unwrap();
         client
             .get(&target.url)
             .send()

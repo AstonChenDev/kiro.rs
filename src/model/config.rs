@@ -151,6 +151,11 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_total_timeout_secs: Option<u64>,
 
+    /// Separate total deadline for each non-streaming upstream request.
+    /// Absent inherits the existing total deadline; explicit 0 disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_non_stream_timeout_secs: Option<u64>,
+
     /// 外部 count_tokens API 地址（可选）
     #[serde(default)]
     pub count_tokens_api_url: Option<String>,
@@ -540,6 +545,7 @@ impl Default for Config {
             upstream_connect_timeout_secs: default_upstream_connect_timeout_secs(),
             upstream_read_timeout_secs: default_upstream_read_timeout_secs(),
             upstream_total_timeout_secs: None,
+            upstream_non_stream_timeout_secs: None,
             count_tokens_api_url: None,
             count_tokens_api_key: None,
             count_tokens_auth_type: default_count_tokens_auth_type(),
@@ -590,6 +596,11 @@ impl Config {
     /// The upstream setting overrides the legacy custom setting only when supplied.
     pub fn effective_upstream_total_timeout_secs(&self) -> u64 {
         self.upstream_total_timeout_secs.unwrap_or(self.upstream_request_timeout_secs.max(1))
+    }
+
+    pub fn effective_upstream_non_stream_timeout_secs(&self) -> u64 {
+        self.upstream_non_stream_timeout_secs
+            .unwrap_or_else(|| self.effective_upstream_total_timeout_secs())
     }
 
     /// 获取默认配置文件路径
@@ -738,6 +749,25 @@ mod tests {
     fn upstream_total_timeout_accepts_zero_to_disable() {
         let config: Config = serde_json::from_str(r#"{"upstreamTotalTimeoutSecs":0}"#).unwrap();
         assert_eq!(config.effective_upstream_total_timeout_secs(), 0);
+    }
+
+    #[test]
+    fn non_stream_timeout_is_independent_and_survives_config_roundtrip() {
+        for (source, stream, non_stream) in [
+            (r#"{}"#, 3600, 3600),
+            (r#"{"upstreamRequestTimeoutSecs":1800}"#, 1800, 1800),
+            (r#"{"upstreamTotalTimeoutSecs":0}"#, 0, 0),
+            (r#"{"upstreamRequestTimeoutSecs":3600,"upstreamNonStreamTimeoutSecs":2400}"#, 3600, 2400),
+            (r#"{"upstreamTotalTimeoutSecs":600,"upstreamNonStreamTimeoutSecs":2400}"#, 600, 2400),
+            (r#"{"upstreamTotalTimeoutSecs":600,"upstreamNonStreamTimeoutSecs":0}"#, 600, 0),
+        ] {
+            let original: Config = serde_json::from_str(source).unwrap();
+            let reloaded: Config = serde_json::from_str(&serde_json::to_string(&original).unwrap()).unwrap();
+            for config in [original, reloaded] {
+                assert_eq!(config.effective_upstream_total_timeout_secs(), stream);
+                assert_eq!(config.effective_upstream_non_stream_timeout_secs(), non_stream);
+            }
+        }
     }
 
     #[test]

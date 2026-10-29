@@ -134,6 +134,7 @@ pub struct KiroProvider {
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client。
     /// 带容量上限淘汰（全局代理 client 常驻），避免代理数量增长导致内存无界增长。
     client_cache: Mutex<ClientCache>,
+    non_stream_client_cache: Mutex<ClientCache>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
     /// 端点实现注册表（key: endpoint 名称）
@@ -174,6 +175,13 @@ impl KiroProvider {
         let proxy = token_manager.proxy();
         // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）
         let config = token_manager.config();
+        tracing::info!(
+            stream_total_secs = config.effective_upstream_total_timeout_secs(),
+            non_stream_total_secs = config.effective_upstream_non_stream_timeout_secs(),
+            connect_secs = config.upstream_connect_timeout_secs,
+            read_secs = config.upstream_read_timeout_secs,
+            "上游请求超时配置"
+        );
         let initial_client = build_client_with_timeouts(
             proxy.as_ref(),
             config.effective_upstream_total_timeout_secs(),
@@ -183,10 +191,21 @@ impl KiroProvider {
         )
         .expect("创建 HTTP 客户端失败");
         let client_cache = ClientCache::new(proxy.clone(), initial_client, CLIENT_CACHE_CAP);
+        let non_stream_client = build_client_with_timeouts(
+            proxy.as_ref(),
+            config.effective_upstream_non_stream_timeout_secs(),
+            tls_backend,
+            config.upstream_connect_timeout_secs,
+            config.upstream_read_timeout_secs,
+        )
+        .expect("创建非流式 HTTP 客户端失败");
+        let non_stream_client_cache =
+            ClientCache::new(proxy, non_stream_client, CLIENT_CACHE_CAP);
 
         Self {
             token_manager,
             client_cache: Mutex::new(client_cache),
+            non_stream_client_cache: Mutex::new(non_stream_client_cache),
             tls_backend,
             endpoints,
             default_endpoint,
@@ -195,8 +214,12 @@ impl KiroProvider {
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
-    fn client_for_proxy(&self, effective: Option<ProxyConfig>) -> anyhow::Result<Client> {
-        let mut cache = self.client_cache.lock();
+    fn client_for_proxy(&self, effective: Option<ProxyConfig>, is_stream: bool) -> anyhow::Result<Client> {
+        let mut cache = if is_stream {
+            self.client_cache.lock()
+        } else {
+            self.non_stream_client_cache.lock()
+        };
         // 在缓存锁内读取最新代理，避免并发请求用旧快照将缓存切回旧全局代理。
         let global_proxy = self.token_manager.proxy();
         cache.set_global_proxy(global_proxy);
@@ -206,7 +229,11 @@ impl KiroProvider {
         let config = self.token_manager.config();
         let client = build_client_with_timeouts(
             effective.as_ref(),
-            config.effective_upstream_total_timeout_secs(),
+            if is_stream {
+                config.effective_upstream_total_timeout_secs()
+            } else {
+                config.effective_upstream_non_stream_timeout_secs()
+            },
             self.tls_backend,
             config.upstream_connect_timeout_secs,
             config.upstream_read_timeout_secs,
@@ -218,12 +245,12 @@ impl KiroProvider {
     /// Snapshot the hot global proxy once per attempt and keep static/DNS ownership
     /// pinned through the response. Cache refresh must not bypass that guard.
     async fn prepare_client(
-        &self, credentials: &KiroCredentials,
+        &self, credentials: &KiroCredentials, is_stream: bool,
     ) -> anyhow::Result<(Client, crate::kiro::token_manager::static_ips::ProxyUse)> {
         let global_proxy = self.token_manager.proxy();
         let effective = credentials.effective_proxy(global_proxy.as_ref());
         let proxy_use = self.token_manager.prepare_proxy_use(credentials, effective.as_ref()).await?;
-        let client = self.client_for_proxy(proxy_use.proxy().cloned())?;
+        let client = self.client_for_proxy(proxy_use.proxy().cloned(), is_stream)?;
         Ok((client, proxy_use))
     }
 
@@ -501,7 +528,7 @@ impl KiroProvider {
             let url = endpoint.mcp_url(&rctx);
             let body = endpoint.transform_mcp_body(request_body, &rctx);
 
-            let (client, proxy_use) = self.prepare_client(&ctx.credentials).await?;
+            let (client, proxy_use) = self.prepare_client(&ctx.credentials, true).await?;
             let base = client
                 .post(&url)
                 .body(body)
@@ -856,7 +883,7 @@ impl KiroProvider {
             tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
             tracing::debug!("实际发送请求体: {}", body);
 
-            let (client, proxy_use) = self.prepare_client(&ctx.credentials).await?;
+            let (client, proxy_use) = self.prepare_client(&ctx.credentials, is_stream).await?;
             let base = client.post(&url)
                 .body(body)
                 .header("content-type", endpoint.content_type());

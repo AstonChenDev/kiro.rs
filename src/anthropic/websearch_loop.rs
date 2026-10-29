@@ -490,10 +490,12 @@ async fn run_round(
         }
     };
 
-    let call_result = match provider
-        .call_api_stream(&request_body, Some(tracer), group)
-        .await
-    {
+    let result = if payload.stream {
+        provider.call_api_stream(&request_body, Some(tracer), group).await
+    } else {
+        provider.call_api(&request_body, Some(tracer), group).await
+    };
+    let call_result = match result {
         Ok(r) => r,
         Err(e) => {
             let error_type = last_attempt_outcome(tracer).unwrap_or(outcome::UNKNOWN);
