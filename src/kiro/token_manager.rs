@@ -1473,17 +1473,9 @@ fn group_matches(cred_groups: &[String], group: Option<&str>) -> bool {
 
 fn credential_matches_request(
     credentials: &KiroCredentials,
-    model: Option<&str>,
+    _model: Option<&str>,
     group: Option<&str>,
 ) -> bool {
-    let is_opus = model
-        .map(|m| m.to_ascii_lowercase().contains("opus"))
-        .unwrap_or(false);
-
-    if is_opus && !credentials.supports_opus() {
-        return false;
-    }
-
     group_matches(&credentials.groups, group)
 }
 
@@ -8844,7 +8836,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_acquire_context_priority_current_respects_model_support() {
+    async fn test_free_opus_routing_respects_model_cache() {
         let mut free_cred = grouped_cred("free", &[]);
         free_cred.subscription_title = Some("KIRO FREE".to_string());
 
@@ -8861,18 +8853,14 @@ mod tests {
         )
         .unwrap();
 
-        // Warm current_id with the highest-priority Free account.
-        let current = manager.acquire_context(None, None).await.unwrap();
-        assert_eq!(current.id, 1);
+        seed_model_cache(&manager, 1, &["claude-opus-4.6"]);
+        seed_model_cache(&manager, 2, &["claude-opus-4.6"]);
+        assert_eq!(manager.select_next_credential(Some("claude-opus-4.6"), None).unwrap().0, 1,
+            "a Free account advertising Opus must be eligible");
 
-        let opus = manager
-            .acquire_context(Some("claude-opus-4.6"), None)
-            .await
-            .unwrap();
-        assert_eq!(
-            opus.id, 2,
-            "priority current_id must not bypass Opus subscription filtering"
-        );
+        seed_model_cache(&manager, 1, &["claude-sonnet-4.6"]);
+        assert_eq!(manager.select_next_credential(Some("claude-opus-4.6"), None).unwrap().0, 2,
+            "an account whose model list excludes Opus must be skipped");
     }
 
     #[test]
